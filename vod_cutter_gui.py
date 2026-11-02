@@ -701,10 +701,18 @@ class UnifiedDotaStudioApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Dota 2 Studio | Монтаж матчей + Реакции/Кейсы + Shorts + Цензор")
-        self.root.geometry("940x980")
-        self.root.minsize(860, 780)
+
+        # Окно подстраивается под экран (в т.ч. при масштабировании Windows)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        win_w = max(760, min(940, sw - 40))
+        win_h = max(520, min(920, sh - 80))
+        pos_x = max(0, (sw - win_w) // 2)
+        pos_y = max(0, (sh - win_h) // 3)
+        self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+        self.root.minsize(max(700, min(860, sw - 120)), max(420, min(600, sh - 160)))
 
         self.ffmpeg_bin = find_ffmpeg()
+        self.temp_dir_var = tk.StringVar(value=TEMP_DIR)
         self.react_fragment_rows = []
 
         self.setup_ui()
@@ -716,22 +724,16 @@ class UnifiedDotaStudioApp:
         style = ttk.Style()
         style.theme_use("clam")
 
+        # Вкладки занимают всё свободное место, консоль — фиксированную высоту снизу
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=False, padx=10, pady=5)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 4))
 
-        self.tab_cutter = ttk.Frame(self.notebook, padding="8")
-        self.tab_react = ttk.Frame(self.notebook, padding="8")
-        self.tab_clips = ttk.Frame(self.notebook, padding="8")
-        self.tab_shorts = ttk.Frame(self.notebook, padding="8")
-        self.tab_censor = ttk.Frame(self.notebook, padding="8")
-        self.tab_overlay = ttk.Frame(self.notebook, padding="8")
-
-        self.notebook.add(self.tab_cutter, text=" 🎬 1. Монтаж матча / Серии ")
-        self.notebook.add(self.tab_react, text=" 📺 2. Реакции / Кейсы / IRL ")
-        self.notebook.add(self.tab_clips, text=" 🔥 3. Топ клипы за месяц ")
-        self.notebook.add(self.tab_shorts, text=" 📱 4. Нарезка Shorts (9:16) ")
-        self.notebook.add(self.tab_censor, text=" 🔇 5. Заглушение матов ")
-        self.notebook.add(self.tab_overlay, text=" 🖼 6. Закрыть баннер PNG ")
+        self.tab_cutter = self._add_scrollable_tab(" 🎬 1. Монтаж ")
+        self.tab_react = self._add_scrollable_tab(" 📺 2. Реакции ")
+        self.tab_clips = self._add_scrollable_tab(" 🔥 3. Клипы ")
+        self.tab_shorts = self._add_scrollable_tab(" 📱 4. Shorts ")
+        self.tab_censor = self._add_scrollable_tab(" 🔇 5. Цензура ")
+        self.tab_overlay = self._add_scrollable_tab(" 🖼 6. Баннер ")
 
         self.build_cutter_tab()
         self.build_react_tab()
@@ -740,24 +742,105 @@ class UnifiedDotaStudioApp:
         self.build_censor_tab()
         self.build_overlay_tab()
 
-        bottom_frame = ttk.Frame(self.root, padding="10")
-        bottom_frame.pack(fill=tk.BOTH, expand=True)
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+
+        bottom_frame = ttk.Frame(self.root, padding=(8, 0, 8, 6))
+        bottom_frame.pack(fill=tk.X, expand=False)
+
+        temp_row = ttk.Frame(bottom_frame)
+        temp_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(temp_row, text="Временные файлы:").pack(side=tk.LEFT)
+        self.temp_dir_entry = ttk.Entry(temp_row, textvariable=self.temp_dir_var)
+        self.temp_dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(temp_row, text="Выбрать...", command=self.browse_temp_dir).pack(side=tk.LEFT)
+        ttk.Button(temp_row, text="Открыть", command=self.open_temp_dir).pack(side=tk.LEFT, padx=(5, 0))
 
         self.progress_bar = ttk.Progressbar(bottom_frame, mode='indeterminate')
-        self.progress_bar.pack(fill=tk.X, pady=(0, 5))
+        self.progress_bar.pack(fill=tk.X, pady=(0, 4))
 
-        log_frame = ttk.LabelFrame(bottom_frame, text=" Консоль событий ", padding="5")
+        log_frame = ttk.LabelFrame(bottom_frame, text=" Консоль событий ", padding="4")
         log_frame.pack(fill=tk.BOTH, expand=True)
 
         self.log_text = scrolledtext.ScrolledText(
             log_frame, wrap=tk.WORD, bg="#1e1e1e", fg="#00ff66",
-            font=("Consolas", 10), insertbackground="white"
+            font=("Consolas", 10), insertbackground="white", height=7
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         self.log("[СИСТЕМА] Программа готова к работе.")
         self.log(f"[СИСТЕМА] Временные файлы: {TEMP_DIR}")
         threading.Thread(target=self._report_gpu_mode, daemon=True).start()
+
+    def _add_scrollable_tab(self, text):
+        """Вкладка с вертикальной прокруткой, чтобы всё влезало на маленьком экране."""
+        outer = ttk.Frame(self.notebook)
+        bg = ttk.Style().lookup("TFrame", "background") or "#dcdad5"
+        canvas = tk.Canvas(outer, highlightthickness=0, bd=0, background=bg)
+        vbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        inner = ttk.Frame(canvas, padding="8")
+        inner._scroll_canvas = canvas
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        self.notebook.add(outer, text=text)
+        return inner
+
+    def _on_mousewheel(self, event):
+        starts = []
+        w = getattr(event, "widget", None)
+        if w is not None:
+            starts.append(w)
+        try:
+            w2 = self.root.winfo_containing(event.x_root, event.y_root)
+            if w2 is not None:
+                starts.append(w2)
+        except Exception:
+            pass
+        for start in starts:
+            w = start
+            while w is not None:
+                canvas = getattr(w, "_scroll_canvas", None)
+                if canvas is not None:
+                    canvas.yview_scroll(-3 if event.delta > 0 else 3, "units")
+                    return "break"
+                w = getattr(w, "master", None)
+
+    def browse_temp_dir(self):
+        cur = self.temp_dir_var.get().strip() or TEMP_DIR
+        d = filedialog.askdirectory(title="Папка для временных файлов",
+                                    initialdir=cur if os.path.isdir(cur) else None)
+        if d:
+            self.apply_temp_dir(d)
+
+    def apply_temp_dir(self, d):
+        global TEMP_DIR
+        d = os.path.normpath(d)
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, f".probe_{os.getpid()}")
+            with open(probe, "w", encoding="utf-8") as pf:
+                pf.write("ok")
+            os.remove(probe)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось использовать папку:\n{d}\n\n{e}")
+            return
+        TEMP_DIR = d
+        tempfile.tempdir = d
+        self.temp_dir_var.set(d)
+        self.save_settings()
+        self.log(f"[СИСТЕМА] Временные файлы теперь в: {d}")
+
+    def open_temp_dir(self):
+        d = self.temp_dir_var.get().strip() or TEMP_DIR
+        try:
+            os.makedirs(d, exist_ok=True)
+            os.startfile(d)
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
 
     def _report_gpu_mode(self):
         if use_qsv(self.ffmpeg_bin):
@@ -783,7 +866,7 @@ class UnifiedDotaStudioApp:
             return default
 
         config = {
-            "temp_dir": TEMP_DIR,
+            "temp_dir": self.temp_dir_var.get() if hasattr(self, "temp_dir_var") else TEMP_DIR,
             "use_gpu_qsv": bool(_config_value("use_gpu_qsv", True)),
             "cut_input": _get("cut_input_entry"),
             "cut_chat_vid": _get("cut_chat_vid_entry"),
@@ -957,6 +1040,10 @@ class UnifiedDotaStudioApp:
             if hasattr(self, 'tg_intro_var'): self.tg_intro_var.set(c.get("tg_intro", False))
             _set_entry("tg_avatar_entry", c.get("tg_avatar", ""))
             _set_entry("tg_link_entry", c.get("tg_link", "t.me/borodkadaxaka"))
+
+            _t = str(c.get("temp_dir", "") or "").strip()
+            if _t and os.path.isdir(_t) and hasattr(self, "temp_dir_var"):
+                self.temp_dir_var.set(os.path.normpath(_t))
 
             # Реакции
             _set_entry("react_input_entry", c.get("react_input", ""))
