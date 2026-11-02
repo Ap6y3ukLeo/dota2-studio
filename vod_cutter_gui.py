@@ -56,6 +56,86 @@ def find_ffmpeg():
         return cwd_ffmpeg
     return shutil.which("ffmpeg") or "ffmpeg"
 
+def _config_value(key, default):
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get(key, default)
+    except Exception:
+        return default
+
+def _pick_temp_dir():
+    """Временные файлы: env DOTA2STUDIO_TEMP -> temp_dir из конфига -> D:\\Dota2StudioTemp -> системный TEMP."""
+    candidates = [
+        os.environ.get("DOTA2STUDIO_TEMP", "").strip(),
+        str(_config_value("temp_dir", "") or "").strip(),
+        "D:\\Dota2StudioTemp",
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        try:
+            os.makedirs(c, exist_ok=True)
+            probe = os.path.join(c, f".probe_{os.getpid()}")
+            with open(probe, "w", encoding="utf-8") as pf:
+                pf.write("ok")
+            os.remove(probe)
+            return c
+        except Exception:
+            continue
+    return tempfile.gettempdir()
+
+TEMP_DIR = _pick_temp_dir()
+try:
+    tempfile.tempdir = TEMP_DIR
+except Exception:
+    pass
+
+_QSV_CACHE = {}
+
+def qsv_available(ffmpeg_bin):
+    """Проверка, что Intel Quick Sync реально инициализируется на этой машине."""
+    key = ffmpeg_bin or "ffmpeg"
+    if key in _QSV_CACHE:
+        return _QSV_CACHE[key]
+    ok = False
+    if not os.environ.get("DOTA2STUDIO_NO_GPU"):
+        try:
+            res = subprocess.run(
+                [ffmpeg_bin, "-hide_banner", "-loglevel", "error",
+                 "-init_hw_device", "qsv=hw",
+                 "-f", "lavfi", "-i", "nullsrc=s=320x180:d=0.2",
+                 "-c:v", "h264_qsv", "-f", "null", "-"],
+                capture_output=True, timeout=25
+            )
+            ok = res.returncode == 0
+        except Exception:
+            ok = False
+    _QSV_CACHE[key] = ok
+    return ok
+
+def use_qsv(ffmpeg_bin):
+    """GPU-кодирование включено по умолчанию; отключается use_gpu_qsv=false в конфиге."""
+    if not _config_value("use_gpu_qsv", True):
+        return False
+    return qsv_available(ffmpeg_bin)
+
+_QSV_PRESETS = {"ultrafast": "veryfast", "superfast": "veryfast", "veryfast": "veryfast",
+                "faster": "medium", "fast": "fast", "medium": "medium",
+                "slow": "slow", "slower": "slower", "veryslow": "veryslow"}
+
+def video_enc_args(ffmpeg_bin, preset="ultrafast", crf=22, fps=60):
+    """Аргументы видеокодека: Intel QSV, если доступен, иначе libx264 (как раньше)."""
+    if use_qsv(ffmpeg_bin):
+        args = ["-c:v", "h264_qsv",
+                "-preset", _QSV_PRESETS.get(preset, "veryfast"),
+                "-global_quality", str(crf), "-look_ahead", "0"]
+    else:
+        args = ["-c:v", "libx264", "-preset", preset,
+                "-tune", "fastdecode", "-threads", "0", "-crf", str(crf)]
+    if fps:
+        args += ["-fps_mode", "cfr", "-r", str(fps)]
+    return args
+
 def ad_probe(ffmpeg_bin, ad_path):
     """(доля кадра под роликом, доля зелёного фона, длительность) — чтобы выбрать способ вставки."""
     try:
@@ -69,7 +149,7 @@ def ad_probe(ffmpeg_bin, ad_path):
             s = min(1080 / w, 1920 / h)
             cov = (w * s) * (h * s) / (1080 * 1920) * 100
         if CV2_AVAILABLE:
-            tmp = os.path.join(tempfile.gettempdir(), f"ad_probe_{int(time.time()*1000)}.png")
+            tmp = os.path.join(TEMP_DIR, f"ad_probe_{int(time.time()*1000)}.png")
             subprocess.run([ffmpeg_bin, "-y", "-ss", "1", "-i", ad_path, "-frames:v", "1",
                             "-vf", "scale=270:480", tmp], capture_output=True)
             img = imread_unicode(tmp)
@@ -360,7 +440,7 @@ def transcribe_speech_intervals(video_path, windows, logger=None):
         return []
 
     ff = find_ffmpeg()
-    tmp_wav = os.path.join(tempfile.gettempdir(), f"speech_{int(time.time()*1000)}.wav")
+    tmp_wav = os.path.join(TEMP_DIR, f"speech_{int(time.time()*1000)}.wav")
     has_cuda = False
     try:
         import torch
@@ -453,8 +533,8 @@ def make_tg_intro(avatar_path, link, out_path, ffmpeg_bin, dur=4.0):
            "-loop", "1", "-t", str(dur), "-i", avatar_path,
            "-f", "lavfi", "-t", str(dur), "-i", "anullsrc=r=44100:cl=stereo",
            "-filter_complex", fc, "-map", "[v]", "-map", "1:a",
-           "-c:v", "libx264", "-preset", "ultrafast", "-tune", "fastdecode", "-threads", "0",
-           "-crf", "22", "-fps_mode", "cfr", "-r", "60", "-c:a", "pcm_s16le", "-ar", "44100",
+           *video_enc_args(ffmpeg_bin, "ultrafast", 22, 60),
+           "-c:a", "pcm_s16le", "-ar", "44100",
            "-t", str(dur), out_path]
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
@@ -512,7 +592,7 @@ def generate_cuts_report(report_path, teaser_segs, story_segs, output_video_path
 
 def run_ffmpeg_with_progress(cmd, total_duration_sec, log_callback):
     cmd_with_progress = cmd[:-1] + ["-progress", "pipe:1", cmd[-1]]
-    err_log_path = os.path.join(tempfile.gettempdir(), "ffmpeg_render_stderr.log")
+    err_log_path = os.path.join(TEMP_DIR, "ffmpeg_render_stderr.log")
 
     with open(err_log_path, "w", encoding="utf-8", errors="replace") as err_file:
         process = subprocess.Popen(
@@ -676,6 +756,14 @@ class UnifiedDotaStudioApp:
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         self.log("[СИСТЕМА] Программа готова к работе.")
+        self.log(f"[СИСТЕМА] Временные файлы: {TEMP_DIR}")
+        threading.Thread(target=self._report_gpu_mode, daemon=True).start()
+
+    def _report_gpu_mode(self):
+        if use_qsv(self.ffmpeg_bin):
+            self.log("[СИСТЕМА] Кодирование: Intel Quick Sync (GPU) — CPU разгружен.")
+        else:
+            self.log("[СИСТЕМА] Кодирование: CPU (libx264). QSV недоступен или отключён (use_gpu_qsv=false).")
 
     # ---------------- СОХРАНЕНИЕ И ВОССТАНОВЛЕНИЕ НАСТРОЕК ----------------
     def save_settings(self):
@@ -695,6 +783,8 @@ class UnifiedDotaStudioApp:
             return default
 
         config = {
+            "temp_dir": TEMP_DIR,
+            "use_gpu_qsv": bool(_config_value("use_gpu_qsv", True)),
             "cut_input": _get("cut_input_entry"),
             "cut_chat_vid": _get("cut_chat_vid_entry"),
             "cut_output": _get("cut_output_entry"),
@@ -719,6 +809,7 @@ class UnifiedDotaStudioApp:
             "m3_s": _get("m3_s", "03:00:00"), "m3_e": _get("m3_e", "03:55:00"),
             "m4_s": _get("m4_s", "04:20:00"), "m4_e": _get("m4_e", "05:15:00"),
             "m5_s": _get("m5_s", "05:40:00"), "m5_e": _get("m5_e", "06:35:00"),
+            "draft_min": [sp.get() for sp in getattr(self, "draft_min_spins", [])],
             "cut_duration": _get("cut_slider", 120),
             "keep_teaser": _get("keep_teaser_var", True),
             "keep_intro": _get("keep_intro_var", True),
@@ -844,6 +935,11 @@ class UnifiedDotaStudioApp:
             _set_entry("m3_s", c.get("m3_s", "03:00:00")); _set_entry("m3_e", c.get("m3_e", "03:55:00"))
             _set_entry("m4_s", c.get("m4_s", "04:20:00")); _set_entry("m4_e", c.get("m4_e", "05:15:00"))
             _set_entry("m5_s", c.get("m5_s", "05:40:00")); _set_entry("m5_e", c.get("m5_e", "06:35:00"))
+            _draft_mins = c.get("draft_min")
+            if _draft_mins and hasattr(self, "draft_min_spins"):
+                for _sp, _v in zip(self.draft_min_spins, _draft_mins):
+                    try: _sp.set(str(_v))
+                    except Exception: pass
             
             dur = c.get("cut_duration", 120)
             if hasattr(self, 'cut_slider'):
@@ -1061,7 +1157,17 @@ class UnifiedDotaStudioApp:
         ttk.Label(r_m2, text="—").pack(side=tk.LEFT)
         self.m5_e = ttk.Entry(r_m2, width=8); self.m5_e.insert(0, "06:35:00"); self.m5_e.pack(side=tk.LEFT, padx=2)
 
-        ttk.Label(self.series_frame, text="* В каждую карту гарантированно попадут ДРАФТ (90с) и ТРОН (120с)", font=("Arial", 8, "italic"), foreground="#00aa00").pack(anchor=tk.W, pady=2)
+        draft_row = ttk.Frame(self.series_frame); draft_row.pack(fill=tk.X, pady=2)
+        ttk.Label(draft_row, text="Драфт (пики), мин:", font=("Arial", 8, "bold")).pack(side=tk.LEFT)
+        self.draft_min_spins = []
+        for _i in range(5):
+            ttk.Label(draft_row, text=f"К{_i + 1}", font=("Arial", 8)).pack(side=tk.LEFT, padx=(6, 0))
+            _sp = ttk.Spinbox(draft_row, from_=0.5, to=30.0, increment=0.5, width=4)
+            _sp.set("1.5")
+            _sp.pack(side=tk.LEFT)
+            self.draft_min_spins.append(_sp)
+
+        ttk.Label(self.series_frame, text="* В каждую карту гарантированно попадут ДРАФТ (сколько указано в «Драфт, мин») и ТРОН (120с)", font=("Arial", 8, "italic"), foreground="#00aa00").pack(anchor=tk.W, pady=2)
 
         story_box = ttk.LabelFrame(self.tab_cutter, text=" 6. Хронометраж и Синхронизация звука ", padding="6")
         story_box.pack(fill=tk.X, pady=3)
@@ -1180,14 +1286,14 @@ class UnifiedDotaStudioApp:
         threading.Thread(target=self.run_cutter_pipeline, args=(inp, chat_vid, out, sw_file, png_file), daemon=True).start()
 
     def run_cutter_pipeline(self, video_path, chat_video_path, output_path, swears_file, png_overlay):
-        temp_audio = os.path.join(tempfile.gettempdir(), "temp_analysis_audio.wav")
-        temp_clips_dir = os.path.join(tempfile.gettempdir(), "temp_clips_vod")
+        temp_audio = os.path.join(TEMP_DIR, "temp_analysis_audio.wav")
+        temp_clips_dir = os.path.join(TEMP_DIR, "temp_clips_vod")
         temp_list = os.path.join(temp_clips_dir, "list.txt")
-        temp_concat_video = os.path.join(tempfile.gettempdir(), "temp_concat_raw.mkv")
+        temp_concat_video = os.path.join(TEMP_DIR, "temp_concat_raw.mkv")
 
-        temp_chat_clips_dir = os.path.join(tempfile.gettempdir(), "temp_clips_chat")
+        temp_chat_clips_dir = os.path.join(TEMP_DIR, "temp_clips_chat")
         temp_chat_list = os.path.join(temp_chat_clips_dir, "list_chat.txt")
-        temp_concat_chat = os.path.join(tempfile.gettempdir(), "temp_concat_chat.mkv")
+        temp_concat_chat = os.path.join(TEMP_DIR, "temp_concat_chat.mkv")
 
         do_chat = self.use_chat_var.get() and chat_video_path and os.path.exists(chat_video_path)
         do_teaser = self.keep_teaser_var.get()
@@ -1271,11 +1377,19 @@ class UnifiedDotaStudioApp:
                 map_segs = []
                 used_map_budget = 0.0
 
-                # 1. Пики и Трон
-                intro_len = 90.0 if self.keep_intro_var.get() else 0.0
+                # 1. Драфт (пики) и Трон
+                draft_min = 1.5
+                try:
+                    if getattr(self, "draft_min_spins", None):
+                        draft_min = float(self.draft_min_spins[map_num - 1].get())
+                except Exception:
+                    draft_min = 1.5
+                intro_len = max(0.0, draft_min * 60.0) if self.keep_intro_var.get() else 0.0
+                intro_len = min(intro_len, max(0.0, m_dur - 60.0))
                 if intro_len > 0 and m_dur > 180:
                     map_segs.append({'range': [m_start, m_start + intro_len], 'priority': 9999})
                     used_map_budget += intro_len
+                    self.log(f"[ДРАФТ] Карта {map_num}: сохранено {intro_len / 60.0:.1f} мин с начала карты.")
 
                 outro_len = 120.0 if self.keep_outro_var.get() else 0.0
                 if outro_len > 0 and m_dur > (intro_len + outro_len + 60):
@@ -1428,9 +1542,7 @@ class UnifiedDotaStudioApp:
                 slice_enc_args = [
                     "-vf", base_vf,
                     "-af", base_af,
-                    "-c:v", "libx264", "-preset", "ultrafast", "-tune", "fastdecode",
-                    "-threads", "0", "-crf", "22",
-                    "-fps_mode", "cfr", "-r", "60",
+                    *video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60),
                     "-c:a", "pcm_s16le", "-ar", "44100"
                 ]
 
@@ -1445,8 +1557,7 @@ class UnifiedDotaStudioApp:
                         chat_vf += f",fade=t=in:st=0:d=0.18,fade=t=out:st={dur - 0.18:.2f}:d=0.18"
 
                     cmd_ccut = [self.ffmpeg_bin, "-y", "-ss", str(ts), "-to", str(te), "-i", chat_video_path,
-                                "-vf", chat_vf, "-c:v", "libx264", "-preset", "ultrafast", "-tune", "fastdecode",
-                                "-threads", "0", "-crf", "22", "-fps_mode", "cfr", "-r", "60",
+                                "-vf", chat_vf] + video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60) + [
                                 "-an", os.path.join(temp_chat_clips_dir, cfn)]
                     subprocess.run(cmd_ccut, capture_output=True)
                     chat_clip_names.append(cfn)
@@ -1457,9 +1568,8 @@ class UnifiedDotaStudioApp:
                     cts = all_story_segments[0][0] if all_story_segments else 0.0
                     cfn = "chat_tg_intro.mkv"
                     subprocess.run([self.ffmpeg_bin, "-y", "-ss", str(cts), "-to", str(cts + 4.0),
-                                    "-i", chat_video_path, "-vf", "setpts=PTS-STARTPTS",
-                                    "-c:v", "libx264", "-preset", "ultrafast", "-tune", "fastdecode",
-                                    "-threads", "0", "-crf", "22", "-fps_mode", "cfr", "-r", "60",
+                                    "-i", chat_video_path, "-vf", "setpts=PTS-STARTPTS"] +
+                                   video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60) + [
                                     "-an", os.path.join(temp_chat_clips_dir, cfn)], capture_output=True)
                     chat_clip_names.insert(len(teaser_segments), cfn)
                 self.log(f"[ТГК] Заставка вставлена после хука (после {len(teaser_segments)} роликов).")
@@ -1549,11 +1659,7 @@ class UnifiedDotaStudioApp:
                 trim_s = abs(audio_delay_ms) / 1000.0
                 audio_filter = f"atrim=start={trim_s:.3f},asetpts=PTS-STARTPTS," + audio_filter
 
-            enc_flags = [
-                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "fastdecode",
-                "-threads", "0", "-crf", "22",
-                "-fps_mode", "cfr", "-r", "60"
-            ]
+            enc_flags = video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60)
 
             if filter_chains:
                 filter_chains.append(f"[{audio_src}]{audio_filter}[a_out]")
@@ -1826,13 +1932,13 @@ class UnifiedDotaStudioApp:
         self.set_busy(True)
 
         def worker():
-            temp_dir = os.path.join(tempfile.gettempdir(), "react_cut_clips")
+            temp_dir = os.path.join(TEMP_DIR, "react_cut_clips")
             temp_list = os.path.join(temp_dir, "list.txt")
-            temp_concat = os.path.join(tempfile.gettempdir(), "react_concat.mkv")
+            temp_concat = os.path.join(TEMP_DIR, "react_concat.mkv")
 
-            temp_chat_dir = os.path.join(tempfile.gettempdir(), "react_chat_clips")
+            temp_chat_dir = os.path.join(TEMP_DIR, "react_chat_clips")
             temp_chat_list = os.path.join(temp_chat_dir, "list_chat.txt")
-            temp_concat_chat = os.path.join(tempfile.gettempdir(), "react_concat_chat.mkv")
+            temp_concat_chat = os.path.join(TEMP_DIR, "react_concat_chat.mkv")
 
             clean_audio_wav = None
 
@@ -1886,7 +1992,7 @@ class UnifiedDotaStudioApp:
                     donation_ranges = []
                     if cut_donations and WHISPER_AVAILABLE:
                         self.log(f"Поиск донатов во фрагменте #{frag_idx+1}...")
-                        temp_wav = os.path.join(tempfile.gettempdir(), f"temp_react_whisper_{frag_idx}.wav")
+                        temp_wav = os.path.join(TEMP_DIR, f"temp_react_whisper_{frag_idx}.wav")
                         subprocess.run([
                             self.ffmpeg_bin, "-y", "-ss", str(seg_start), "-to", str(seg_end),
                             "-i", vid, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", temp_wav
@@ -1959,7 +2065,8 @@ class UnifiedDotaStudioApp:
                 chat_clip_names = []
                 slice_args = [
                     "-vf", "setpts=PTS-STARTPTS", "-af", "asetpts=PTS-STARTPTS,aresample=44100:first_pts=0",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-r", "60", "-c:a", "pcm_s16le", "-ar", "44100"
+                ] + video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60) + [
+                    "-c:a", "pcm_s16le", "-ar", "44100"
                 ]
 
                 for idx, (st, en) in enumerate(all_final_segments):
@@ -1971,8 +2078,7 @@ class UnifiedDotaStudioApp:
                     if do_chat:
                         cfn = f"chat_{idx:04d}.mkv"
                         cmd_c = [self.ffmpeg_bin, "-y", "-ss", str(st), "-to", str(en), "-i", chat_vid,
-                                 "-vf", "setpts=PTS-STARTPTS", "-c:v", "libx264", "-preset", "ultrafast",
-                                 "-threads", "0", "-crf", "22", "-fps_mode", "cfr", "-r", "60",
+                                 "-vf", "setpts=PTS-STARTPTS"] + video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60) + [
                                  "-an", os.path.join(temp_chat_dir, cfn)]
                         subprocess.run(cmd_c, capture_output=True)
                         chat_clip_names.append(cfn)
@@ -2027,7 +2133,7 @@ class UnifiedDotaStudioApp:
                     filter_chains.append(f"[{cur_v}][logo]overlay={pos_x}:{pos_y}[v_out]")
                     cur_v = "v_out"
 
-                enc = ["-c:v", "libx264", "-preset", "faster", "-crf", "20", "-r", "60", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+                enc = video_enc_args(self.ffmpeg_bin, "faster", 20, 60) + ["-c:a", "aac", "-b:a", "192k", "-shortest"]
                 if filter_chains:
                     audio_src = f"{len(inputs)//2}:a:0" if clean_audio_wav else "0:a:0"
                     if clean_audio_wav: inputs.extend(["-i", clean_audio_wav])
@@ -2104,7 +2210,7 @@ class UnifiedDotaStudioApp:
 
         self.set_busy(True)
         def worker():
-            temp_dir = os.path.join(tempfile.gettempdir(), "dota_studio_clips")
+            temp_dir = os.path.join(TEMP_DIR, "dota_studio_clips")
             try:
                 clip_items = download_top_twitch_clips_ytdlp(ch, range_code, limit, temp_dir, self.log)
                 if not clip_items: raise RuntimeError("Не удалось скачать клипы.")
@@ -2217,7 +2323,7 @@ class UnifiedDotaStudioApp:
         self.set_busy(True)
 
         def worker():
-            temp_audio = os.path.join(tempfile.gettempdir(), "temp_shorts_audio.wav")
+            temp_audio = os.path.join(TEMP_DIR, "temp_shorts_audio.wav")
             try:
                 subprocess.run([self.ffmpeg_bin, "-y", "-i", vid, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", temp_audio], capture_output=True)
                 rate, data = wavfile.read(temp_audio); data = data.astype(np.float32)
@@ -2259,12 +2365,14 @@ class UnifiedDotaStudioApp:
                         filter_complex = stack + "[v_out]"
                     if ad_file:
                         cmd = [self.ffmpeg_bin, "-y", "-ss", str(start_s), "-to", str(end_s), "-i", vid, "-i", ad_file,
-                               "-filter_complex", filter_complex, "-map", "[v]", "-map", "[a]",
-                               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-r", "60", "-c:a", "aac", "-b:a", "192k", out_name]
+                               "-filter_complex", filter_complex, "-map", "[v]", "-map", "[a]"] + \
+                              video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60) + \
+                              ["-c:a", "aac", "-b:a", "192k", out_name]
                     else:
                         cmd = [self.ffmpeg_bin, "-y", "-ss", str(start_s), "-to", str(end_s), "-i", vid,
-                               "-filter_complex", filter_complex, "-map", "[v_out]", "-map", "0:a:0",
-                               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-r", "60", "-c:a", "aac", "-b:a", "192k", out_name]
+                               "-filter_complex", filter_complex, "-map", "[v_out]", "-map", "0:a:0"] + \
+                              video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60) + \
+                              ["-c:a", "aac", "-b:a", "192k", out_name]
                     res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
                     if res.returncode != 0:
                         self.log(f"[ОШИБКА] {os.path.basename(out_name)}: {res.stderr.strip()[-300:]}")
@@ -2400,7 +2508,8 @@ class UnifiedDotaStudioApp:
 
                 filter_complex_str = f"[1:v]scale={target_w}:{target_h}[logo];[0:v][logo]overlay={pos_x}:{pos_y}[v_out]"
                 cmd = [self.ffmpeg_bin, "-y", "-i", vid, "-i", real_png, "-filter_complex", filter_complex_str,
-                       "-map", "[v_out]", "-map", "0:a?", "-c:v", "libx264", "-preset", "faster", "-crf", "20", "-c:a", "copy", out]
+                       "-map", "[v_out]", "-map", "0:a?"] + video_enc_args(self.ffmpeg_bin, "faster", 20, None) + [
+                       "-c:a", "copy", out]
                 subprocess.run(cmd, capture_output=True)
                 self.log(f"[УСПЕХ] Готово: {out}")
                 self.root.after(0, lambda: messagebox.showinfo("Готово!", "Баннер закрыт!"))
@@ -2421,8 +2530,8 @@ class UnifiedDotaStudioApp:
             self.log("[ЦЕНЗОР] Словарь матов пуст или не найден.")
             return None, 0
 
-        temp_wav = os.path.join(tempfile.gettempdir(), f"censor_in_{int(time.time()*1000)}.wav")
-        out_clean_wav = os.path.join(tempfile.gettempdir(), f"censor_out_{int(time.time()*1000)}.wav")
+        temp_wav = os.path.join(TEMP_DIR, f"censor_in_{int(time.time()*1000)}.wav")
+        out_clean_wav = os.path.join(TEMP_DIR, f"censor_out_{int(time.time()*1000)}.wav")
 
         try:
             self.log("[ЦЕНЗОР] Экспорт аудиодорожки для анализа речи...")
