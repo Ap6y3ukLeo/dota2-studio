@@ -154,6 +154,15 @@ def swap_to_cpu(cmd):
         i += 1
     return out
 
+def ffmpeg_reason(stderr):
+    """Достаёт из вывода ffmpeg самую информативную строку об ошибке."""
+    lines = [l.strip() for l in (stderr or "").splitlines() if l.strip()]
+    for l in lines:
+        low = l.lower()
+        if "error" in low or "invalid" in low or "no such" in low or "not found" in low:
+            return l
+    return lines[-1] if lines else "неизвестная ошибка"
+
 def ffmpeg_run(cmd, ffmpeg_bin, log=None):
     """Запуск ffmpeg: если GPU-энкодер отказал — один повтор на CPU, чтобы не терять прогон."""
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
@@ -867,7 +876,10 @@ def build_clips_compilation(clip_items, out_path, ffmpeg_bin, titles=True, fade=
         path = item["path"]
         title = " ".join((item.get("title") or "").split())
         src_w, src_h, _, has_audio, dur = probe_media(ffmpeg_bin, path)
-        dur = dur or 0.0
+        if not src_w or not src_h or not dur:
+            if log:
+                log(f"[КЛИПЫ] Пропуск {os.path.basename(path)}: файл не читается")
+            continue
         src_w, src_h = src_w or W, src_h or H
 
         inputs = ["-i", path]
@@ -909,23 +921,39 @@ def build_clips_compilation(clip_items, out_path, ffmpeg_bin, titles=True, fade=
         a_idx = "0:a"
         if not has_audio:
             a_idx = str(len(inputs) // 2)
-            inputs += ["-f", "lavfi", "-t", f"{max(3.0, dur):.3f}", "-i", "anullsrc=r=44100:cl=stereo"]
+            inputs += ["-f", "lavfi", "-t", f"{max(1.0, dur):.3f}", "-i", "anullsrc=r=44100:cl=stereo"]
 
         name = f"norm_{i:03d}.mkv"
-        cmd = [ffmpeg_bin, "-y"] + inputs + [
-            "-filter_complex", ";".join(chains), "-map", f"[{cur}]", "-map", a_idx,
-        ] + video_enc_args(ffmpeg_bin, "ultrafast", 22, fps) + [
-            "-c:a", "aac", "-b:a", "192k", "-shortest", os.path.join(tmp_dir, name)
+        out_i = os.path.join(tmp_dir, name)
+        head = ["-filter_complex", ";".join(chains), "-map", f"[{cur}]"]
+        tail = video_enc_args(ffmpeg_bin, "ultrafast", 22, fps) + [
+            "-c:a", "aac", "-b:a", "192k", "-t", f"{dur:.3f}", out_i
         ]
-        r = ffmpeg_run(cmd, ffmpeg_bin, log)
+
+        r = ffmpeg_run([ffmpeg_bin, "-y"] + inputs + head + ["-map", a_idx] + tail, ffmpeg_bin, log)
+        if r.returncode != 0 and has_audio:
+            # частая причина нулевых кадров у клипов Twitch — битая аудиодорожка
+            if log:
+                log(f"[КЛИПЫ] Клип {i + 1}: звук не читается, подставляю тишину")
+            s_idx = len(inputs) // 2
+            inputs2 = inputs + ["-f", "lavfi", "-t", f"{max(1.0, dur):.3f}", "-i", "anullsrc=r=44100:cl=stereo"]
+            r = ffmpeg_run([ffmpeg_bin, "-y"] + inputs2 + head + ["-map", str(s_idx)] + tail, ffmpeg_bin, log)
+
         if r.returncode != 0:
-            raise RuntimeError(f"Клип {i + 1} не обработался:\n{r.stderr.strip()[-300:]}")
+            if log:
+                log(f"[КЛИПЫ] Клип {i + 1} ({os.path.basename(path)}) не обработался — пропускаю: "
+                    f"{ffmpeg_reason(r.stderr)}")
+            continue
         names.append(name)
         real_dur = probe_media(ffmpeg_bin, os.path.join(tmp_dir, name))[4] or dur
         entries.append((acc, real_dur, title))
         acc += real_dur
         if log:
             log(f"[КЛИПЫ] {i + 1}/{len(clip_items)} готов" + (f": {title[:40]}" if title else ""))
+
+    if not names:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError("Ни один клип не удалось обработать — смотри причины в логе")
 
     with open(os.path.join(tmp_dir, "list.txt"), "w", encoding="utf-8") as f:
         for n in names:
