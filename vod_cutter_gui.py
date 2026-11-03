@@ -815,37 +815,39 @@ def _ff_path(p):
     """Путь для фильтра ffmpeg: прямые слэши и экранированное двоеточие диска."""
     return "'" + os.path.abspath(p).replace("\\", "/").replace(":", r"\:") + "'"
 
-def detect_banner_box(ffmpeg_bin, path):
-    """Плашка букмекера сверху кадра: авто-поиск, иначе проверка стандартного места. Координаты исходника."""
+def detect_banner_box(ffmpeg_bin, path, frames=(0.2, 0.5, 0.8)):
+    """Плашка букмекера в правом верхнем или нижнем углу.
+    Возвращает (box, чисто_ли_найдена). Координаты исходника."""
     if not CV2_AVAILABLE or not os.path.exists(path):
-        return None
+        return None, False
+    best = None
+    cap = None
     try:
         cap = cv2.VideoCapture(path)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * 0.3))
-        ok, frame = cap.read()
-        cap.release()
-        if not ok or frame is None:
-            return None
-        H, W = frame.shape[:2]
-
-        box = detect_fonbet_box_single_frame(frame)
-        if box:
-            x, y, bw, bh = box
-            # плашка стримера живёт сверху справа, а не в гуще драки
-            if (y + bh / 2.0) <= H * 0.22 and (x + bw / 2.0) >= W * 0.45:
-                return box
-
-        fx, fy, fw, fh = int(W * 0.823), int(H * 0.028), int(W * 0.151), int(H * 0.065)
-        roi = frame[fy:fy + fh, fx:fx + fw]
-        if roi.size:
-            b, g, r = roi[:, :, 0].astype(int), roi[:, :, 1].astype(int), roi[:, :, 2].astype(int)
-            red = ((r > 110) & (r - g > 45) & (r - b > 45)).mean()
-            if red > 0.18:
-                return (fx, fy, fw, fh)
-        return None
+        for f in frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * f))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            H, W = frame.shape[:2]
+            for fx, fy, fw, fh in ((0.78, 0.015, 0.20, 0.09), (0.74, 0.70, 0.24, 0.12)):
+                x, y, w, h = int(W * fx), int(H * fy), int(W * fw), int(H * fh)
+                box = detect_fonbet_box_single_frame(frame[y:y + h, x:x + w])
+                if not box:
+                    continue
+                bx, by, bw, bh = box
+                # если «плашкой» оказался весь угол — фон тоже красный, точных границ нет
+                if bw * bh < w * h * 0.7:
+                    return (x + bx, y + by, bw, bh), True
+                if best is None:
+                    best = (x + bx, y + by, bw, bh)
     except Exception:
-        return None
+        pass
+    finally:
+        if cap is not None:
+            cap.release()
+    return best, False
 
 def build_clips_compilation(clip_items, out_path, ffmpeg_bin, titles=True, fade=True,
                             overlay_png=None, log=None):
@@ -872,6 +874,22 @@ def build_clips_compilation(clip_items, out_path, ffmpeg_bin, titles=True, fade=
     names = []
     entries = []
     acc = 0.0
+
+    # один раз ищем плашку по всем клипам: раскладка у стрима одинаковая,
+    # поэтому надёжный бокс из любого клипа годится для остальных
+    boxes = [(None, False)] * len(clip_items)
+    canonical = None
+    if logo:
+        for j, item in enumerate(clip_items):
+            b, clean = detect_banner_box(ffmpeg_bin, item["path"])
+            boxes[j] = (b, clean)
+            if clean and canonical is None:
+                canonical = b
+        if canonical and log:
+            log(f"[КЛИПЫ] Плашка: x={canonical[0]}, y={canonical[1]}, {canonical[2]}x{canonical[3]}")
+        elif log:
+            log("[КЛИПЫ] Плашку не нашёл — баннер не закрываю")
+
     for i, item in enumerate(clip_items):
         path = item["path"]
         title = " ".join((item.get("title") or "").split())
@@ -888,7 +906,8 @@ def build_clips_compilation(clip_items, out_path, ffmpeg_bin, titles=True, fade=
         title_y = 40
 
         if logo:
-            box = detect_banner_box(ffmpeg_bin, path)
+            b, clean = boxes[i]
+            box = b if clean else (canonical or b)
             if box:
                 bx, by, bw, bh = box
                 bx, by = int(bx * W / src_w), int(by * H / src_h)
@@ -896,9 +915,18 @@ def build_clips_compilation(clip_items, out_path, ffmpeg_bin, titles=True, fade=
                 tw, th = int(bw * 1.5), int(bh * 1.5)
                 px = max(0, min(W - tw, bx + bw // 2 - tw // 2))
                 py = max(0, min(H - th, by + bh // 2 - th // 2))
+                # картинка обычно вырезана с прозрачным фоном — под неё кладём плотную подложку,
+                # иначе плашка просвечивает по краям. Берём с запасом: контур может быть на пару пикселей уже
+                mx = max(4, int(bw * 0.04))
+                my = max(4, int(bh * 0.08))
+                fx = max(0, bx - mx)
+                fy = max(0, by - my)
+                fw2 = min(W - fx, bw + mx * 2)
+                fh2 = min(H - fy, bh + my * 2)
+                chains.append(f"[{cur}]drawbox=x={fx}:y={fy}:w={fw2}:h={fh2}:color=black:t=fill[bgb]")
                 inputs += ["-i", logo]
                 chains.append(f"[1:v]scale={tw}:{th}[logo]")
-                chains.append(f"[{cur}][logo]overlay={px}:{py}[ov]")
+                chains.append(f"[bgb][logo]overlay={px}:{py}[ov]")
                 cur = "ov"
                 title_y = min(H - 120, py + th + 24)
 
