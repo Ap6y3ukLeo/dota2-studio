@@ -1091,6 +1091,71 @@ def transcribe_segments(video_path, log=None):
         log(f"[ОПИСАНИЕ] Распознано фрагментов: {len(rows)}")
     return rows
 
+def read_chapters(video_path):
+    """Ищет рядом с видео файл таймкодов от монтажа/сборника и достаёт главы [(секунды, название)]."""
+    base = os.path.splitext(os.path.abspath(video_path))[0]
+    d, name = os.path.split(base)
+    candidates = []
+    try:
+        for f in os.listdir(d or "."):
+            low = f.lower()
+            if low.startswith(name.lower()) and low.endswith(".txt") and ("таймкод" in low or "глав" in low):
+                candidates.append(os.path.join(d, f))
+    except Exception:
+        return []
+    if not candidates:
+        return []
+
+    chapters = []
+    in_block = False
+    try:
+        with open(sorted(candidates)[0], encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.rstrip("\n")
+                if "ГОТОВЫЕ ГЛАВЫ" in s:
+                    in_block = True
+                    continue
+                if not in_block:
+                    continue
+                if not s.strip():
+                    if chapters:
+                        break
+                    continue
+                m = re.match(r"\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]\s*(.+)", s)
+                if m:
+                    t = parse_time_str(m.group(1))
+                    if t is not None:
+                        title = re.sub(r"\s*\(\d{1,2}:\d{2}(?::\d{2})?\)\s*$", "", m.group(2)).strip()
+                        chapters.append((t, title))
+    except Exception:
+        return []
+    return chapters
+
+def _fix_chapters(answer, chapters):
+    """Ставит в главы реальные таймкоды, оставляя названия от модели."""
+    lines = answer.splitlines()
+    out, i = [], 0
+    while i < len(lines) and not lines[i].strip().upper().startswith("ГЛАВЫ"):
+        out.append(lines[i])
+        i += 1
+
+    names = []
+    if i < len(lines):
+        i += 1
+        while i < len(lines):
+            s = lines[i].strip()
+            i += 1
+            if not s:
+                continue
+            s = re.sub(r"^[\d:]{3,9}\s*[-–—]?\s*", "", s)
+            if s:
+                names.append(s)
+
+    out.append("ГЛАВЫ:")
+    for idx, (t, default_name) in enumerate(chapters):
+        out.append(f"{format_time_hms(t)} {names[idx] if idx < len(names) else default_name}")
+    return "\n".join(out).rstrip()
+
 def make_description(video_path, out_path, api_key, log=None, max_chars=30000):
     """Расшифровка -> DeepSeek -> текстовый файл с заголовком, описанием, тегами и главами."""
     rows = transcribe_segments(video_path, log)
@@ -1101,6 +1166,22 @@ def make_description(video_path, out_path, api_key, log=None, max_chars=30000):
     if len(text) > max_chars:
         text = text[:max_chars - 8000] + "\n...(середина пропущена)...\n" + text[-7000:]
 
+    chapters = read_chapters(video_path)
+    if chapters:
+        fixed = "\n".join(f"{format_time_hms(t)} {name}" for t, name in chapters)
+        if log:
+            log(f"[ОПИСАНИЕ] Взял готовые главы из файла таймкодов: {len(chapters)} шт.")
+        chapter_task = (
+            "Главы уже известны — это реальные границы эпизодов готового ролика. "
+            "Придумай каждой короткое название (2-5 слов), порядок и количество не меняй.\n"
+            "Вот они:\n" + fixed + "\n"
+        )
+    else:
+        chapter_task = (
+            "- Главы: 5-10 штук, формат «ММ:СС Название», первая строго «00:00 ...». "
+            "Таймкоды бери из расшифровки, не выдумывай.\n"
+        )
+
     prompt = (
         "Ниже расшифровка готового YouTube-ролика с нарезками стримов Dota 2 "
         "(стример Daxak, канал «Бородка Дахака»).\n\n"
@@ -1109,9 +1190,8 @@ def make_description(video_path, out_path, api_key, log=None, max_chars=30000):
         "- Заголовок: до 90 символов, по-русски, цепляющий, но без обмана.\n"
         "- Описание: 2-3 абзаца по 2-3 предложения, живым языком, без воды и без выдумок.\n"
         "- Хэштеги: 12-15 штук через пробел, по теме Dota 2.\n"
-        "- Главы: 5-10 штук, формат «ММ:СС Название», первая строго «00:00 ...». "
-        "Таймкоды бери из расшифровки, не выдумывай.\n\n"
-        "Ответ строго в таком виде, без пояснений:\n"
+        + chapter_task +
+        "\nОтвет строго в таком виде, без пояснений:\n"
         "ЗАГОЛОВОК: ...\n"
         "ОПИСАНИЕ:\n...\n"
         "ХЭШТЕГИ: ...\n"
@@ -1126,6 +1206,9 @@ def make_description(video_path, out_path, api_key, log=None, max_chars=30000):
     answer = (answer or "").strip()
     if not answer:
         raise RuntimeError("DeepSeek вернул пустой ответ")
+
+    if chapters:
+        answer = _fix_chapters(answer, chapters)
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(answer + "\n")
