@@ -541,6 +541,75 @@ def make_tg_intro(avatar_path, link, out_path, ffmpeg_bin, dur=4.0):
         raise RuntimeError("Не собралась вставка ТГК:\n" + r.stderr.strip()[-400:])
     return out_path
 
+def probe_media(ffmpeg_bin, path):
+    """(ширина, высота, fps, есть_аудио, длительность) — из заголовка файла."""
+    try:
+        info = subprocess.run([ffmpeg_bin, "-i", path], capture_output=True, text=True,
+                              errors="replace").stderr
+    except Exception:
+        return None, None, None, False, None
+    w = h = fps = dur = None
+    m = re.search(r"Video: .*?(\d{2,5})x(\d{2,5})", info)
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+    m = re.search(r"(\d+(?:\.\d+)?) fps", info)
+    if m:
+        fps = float(m.group(1))
+    m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", info)
+    if m:
+        dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    return w, h, fps, ("Audio:" in info), dur
+
+def output_to_source_time(segments, t_out):
+    """Переводит время готового ролика во время исходного VOD по списку склеек."""
+    acc = 0.0
+    for s, e in segments:
+        d = max(0.0, e - s)
+        if t_out <= acc + d:
+            return s + (t_out - acc)
+        acc += d
+    return None
+
+def insert_ad_at(video_path, ad_path, at_sec, out_path, ffmpeg_bin, total_hint=None, log_callback=None):
+    """Вставляет рекламный ролик в видео на заданном времени. Один проход, без промежуточных файлов."""
+    W, H, fps, _, dur = probe_media(ffmpeg_bin, video_path)
+    _, _, _, ad_audio, ad_dur = probe_media(ffmpeg_bin, ad_path)
+    if not W or not H:
+        raise RuntimeError("Не удалось прочитать параметры видео")
+    fps = fps or 60
+    at = max(0.1, float(at_sec))
+    if dur:
+        at = min(at, max(0.1, dur - 0.1))
+
+    fc = (
+        f"[0:v]trim=0:{at:.3f},setpts=PTS-STARTPTS,fps={fps:g},setsar=1[v1];"
+        f"[0:v]trim=start={at:.3f},setpts=PTS-STARTPTS,fps={fps:g},setsar=1[v2];"
+        f"[1:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+        f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps:g},format=yuv420p[vad];"
+        "[v1][vad][v2]concat=n=3:v=1:a=0[v];"
+        f"[0:a]atrim=0:{at:.3f},asetpts=PTS-STARTPTS,aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[aa1];"
+        f"[0:a]atrim=start={at:.3f},asetpts=PTS-STARTPTS,aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[aa2];"
+    )
+    src_a = "1:a" if ad_audio else "2:a"
+    fc += f"[{src_a}]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[aad];"
+    fc += "[aa1][aad][aa2]concat=n=3:v=0:a=1[a]"
+
+    cmd = [ffmpeg_bin, "-y", "-i", video_path, "-i", ad_path]
+    if not ad_audio:
+        cmd += ["-f", "lavfi", "-t", f"{(ad_dur or 1.0):.3f}", "-i", "anullsrc=r=44100:cl=stereo"]
+    cmd += ["-filter_complex", fc, "-map", "[v]", "-map", "[a]"]
+    cmd += video_enc_args(ffmpeg_bin, "faster", 20, fps)
+    cmd += ["-c:a", "aac", "-b:a", "192k", out_path]
+
+    total = total_hint or ((dur or 0) + (ad_dur or 0))
+    if log_callback:
+        run_ffmpeg_with_progress(cmd, total, log_callback)
+    else:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        if r.returncode != 0:
+            raise RuntimeError("Не удалось вставить рекламу:\n" + r.stderr.strip()[-400:])
+    return out_path
+
 def generate_cuts_report(report_path, teaser_segs, story_segs, output_video_path):
     """Создает подробный текстовый отчет со склейками и главами YouTube."""
     try:
@@ -734,6 +803,7 @@ class UnifiedDotaStudioApp:
         self.tab_shorts = self._add_scrollable_tab(" 📱 4. Shorts ")
         self.tab_censor = self._add_scrollable_tab(" 🔇 5. Цензура ")
         self.tab_overlay = self._add_scrollable_tab(" 🖼 6. Баннер ")
+        self.tab_ads = self._add_scrollable_tab(" 📢 7. Реклама ")
 
         self.build_cutter_tab()
         self.build_react_tab()
@@ -741,6 +811,7 @@ class UnifiedDotaStudioApp:
         self.build_shorts_tab()
         self.build_censor_tab()
         self.build_overlay_tab()
+        self.build_ad_tab()
 
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
 
@@ -904,6 +975,13 @@ class UnifiedDotaStudioApp:
             "tg_intro": _get("tg_intro_var", False),
             "tg_avatar": _get("tg_avatar_entry"),
             "tg_link": _get("tg_link_entry"),
+            "ad_cut_on": _get("ad_cut_var", False),
+            "ad_cut_file": _get("ad_cut_entry"),
+            "ad_cut_time": _get("ad_cut_time_entry", "01:00"),
+            "ad_src": _get("ad_src_entry"),
+            "ad_file": _get("ad_file_entry"),
+            "ad_out": _get("ad_out_entry"),
+            "ad_time": _get("ad_time_entry", "01:00"),
 
             # Реакции
             "react_input": _get("react_input_entry"),
@@ -1040,6 +1118,13 @@ class UnifiedDotaStudioApp:
             if hasattr(self, 'tg_intro_var'): self.tg_intro_var.set(c.get("tg_intro", False))
             _set_entry("tg_avatar_entry", c.get("tg_avatar", ""))
             _set_entry("tg_link_entry", c.get("tg_link", "t.me/borodkadaxaka"))
+            if hasattr(self, 'ad_cut_var'): self.ad_cut_var.set(c.get("ad_cut_on", False))
+            _set_entry("ad_cut_entry", c.get("ad_cut_file", ""))
+            _set_entry("ad_cut_time_entry", c.get("ad_cut_time", "01:00"))
+            _set_entry("ad_src_entry", c.get("ad_src", ""))
+            _set_entry("ad_file_entry", c.get("ad_file", ""))
+            _set_entry("ad_out_entry", c.get("ad_out", ""))
+            _set_entry("ad_time_entry", c.get("ad_time", "01:00"))
 
             _t = str(c.get("temp_dir", "") or "").strip()
             if _t and os.path.isdir(_t) and hasattr(self, "temp_dir_var"):
@@ -1302,6 +1387,21 @@ class UnifiedDotaStudioApp:
         self.tg_avatar_entry = ttk.Entry(tg_row, width=48); self.tg_avatar_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(tg_row, text="Обзор...", command=self.browse_tg_avatar).pack(side=tk.LEFT)
 
+        adv_box = ttk.LabelFrame(self.tab_cutter, text=" 8. Реклама в готовый ролик (только если тишина) ", padding="6")
+        adv_box.pack(fill=tk.X, pady=3)
+
+        adv_top = ttk.Frame(adv_box); adv_top.pack(fill=tk.X, pady=2)
+        self.ad_cut_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(adv_top, text="Вставлять рекламный ролик", variable=self.ad_cut_var).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Label(adv_top, text="На:").pack(side=tk.LEFT)
+        self.ad_cut_time_entry = ttk.Entry(adv_top, width=10); self.ad_cut_time_entry.insert(0, "01:00"); self.ad_cut_time_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Label(adv_top, text="(если стример в этот момент молчит)", font=("Arial", 8, "italic"), foreground="#00aa00").pack(side=tk.LEFT)
+
+        adv_row = ttk.Frame(adv_box); adv_row.pack(fill=tk.X, pady=2)
+        ttk.Label(adv_row, text="Ролик (MP4):").pack(side=tk.LEFT)
+        self.ad_cut_entry = ttk.Entry(adv_row, width=48); self.ad_cut_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(adv_row, text="Обзор...", command=self.browse_ad_cut_file).pack(side=tk.LEFT)
+
         self.btn_run_cutter = ttk.Button(self.tab_cutter, text="▶ СОБРАТЬ ФИНАЛ (БЕЗ РАССИНХРОНА)", command=self.start_cutter)
         self.btn_run_cutter.pack(fill=tk.X, pady=6, ipady=5)
 
@@ -1365,6 +1465,13 @@ class UnifiedDotaStudioApp:
             tg_av = self.tg_avatar_entry.get().strip()
             if not tg_av or not os.path.exists(tg_av):
                 messagebox.showerror("Ошибка", "Выберите аватарку для вставки ТГК!"); return
+
+        if getattr(self, "ad_cut_var", None) is not None and self.ad_cut_var.get():
+            adf = self.ad_cut_entry.get().strip()
+            if not adf or not os.path.exists(adf):
+                messagebox.showerror("Ошибка", "Выберите рекламный ролик для вставки!"); return
+            if parse_time_str(self.ad_cut_time_entry.get()) is None:
+                messagebox.showerror("Ошибка", "Тайминг рекламы в формате 01:00"); return
 
         out_dir = os.path.dirname(os.path.abspath(out))
         if out_dir: os.makedirs(out_dir, exist_ok=True)
@@ -1599,6 +1706,26 @@ class UnifiedDotaStudioApp:
             self.log("=" * 60)
             self.log(f"ВСЕ КАРТЫ СОБРАНЫ: {len(all_story_segments)} сцен. Хронометраж: {int(total_s//60)} мин ({int(total_s//3600)}ч {int((total_s%3600)//60)}м).")
 
+            # 8. Реклама в готовый ролик: ставим только если в этот момент стример молчит
+            ad_cut_at_out = None
+            ad_cut_dur = 0.0
+            ad_cut_has_audio = False
+            ad_cut_time = parse_time_str(self.ad_cut_time_entry.get()) if hasattr(self, "ad_cut_time_entry") else None
+            ad_cut_file = self.ad_cut_entry.get().strip() if hasattr(self, "ad_cut_entry") else ""
+            if (self.ad_cut_var.get() if hasattr(self, "ad_cut_var") else False) and ad_cut_time and os.path.exists(ad_cut_file):
+                src_t = output_to_source_time(teaser_segments + all_story_segments, ad_cut_time)
+                if src_t is None:
+                    self.log("[РЕКЛАМА] Тайминг за пределами ролика — вставка пропущена.")
+                else:
+                    phrases = transcribe_speech_intervals(video_path, [(max(0.0, src_t - 4.0), src_t + 6.0)], self.log)
+                    if any(a <= src_t <= b for a, b in phrases):
+                        self.log(f"[РЕКЛАМА] На {format_time_hms(ad_cut_time)} стример говорит — вставка пропущена.")
+                    else:
+                        _, _, _, ad_cut_has_audio, ad_cut_dur = probe_media(self.ffmpeg_bin, ad_cut_file)
+                        ad_cut_at_out = float(ad_cut_time)
+                        total_s += (ad_cut_dur or 0.0)
+                        self.log(f"[РЕКЛАМА] Тишина — ставлю ролик на {format_time_hms(ad_cut_time)}.")
+
             os.makedirs(temp_clips_dir, exist_ok=True)
             if do_chat: os.makedirs(temp_chat_clips_dir, exist_ok=True)
 
@@ -1748,8 +1875,37 @@ class UnifiedDotaStudioApp:
 
             enc_flags = video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60)
 
+            # вставка рекламы в готовый ролик (без второго прохода кодирования)
+            if ad_cut_at_out is not None:
+                W, H, _, _, _ = probe_media(self.ffmpeg_bin, temp_concat_video)
+                W, H = W or 1920, H or 1080
+                ad_idx = len(inputs) // 2
+                inputs.extend(["-i", ad_cut_file])
+                if ad_cut_has_audio:
+                    ad_a_idx = ad_idx
+                else:
+                    ad_a_idx = len(inputs) // 2
+                    inputs.extend(["-f", "lavfi", "-t", f"{(ad_cut_dur or 1.0):.3f}", "-i", "anullsrc=r=44100:cl=stereo"])
+
+                filter_chains.append(f"[{cur_v}]fps=60,setsar=1,format=yuv420p,split=2[adt1][adt2]")
+                filter_chains.append(f"[adt1]trim=0:{ad_cut_at_out:.3f},setpts=PTS-STARTPTS[adp1]")
+                filter_chains.append(f"[adt2]trim=start={ad_cut_at_out:.3f},setpts=PTS-STARTPTS[adp2]")
+                filter_chains.append(
+                    f"[{ad_idx}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                    f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=60,format=yuv420p[adv]"
+                )
+                filter_chains.append("[adp1][adv][adp2]concat=n=3:v=1:a=0[v_ad]")
+                cur_v = "v_ad"
+
             if filter_chains:
-                filter_chains.append(f"[{audio_src}]{audio_filter}[a_out]")
+                if ad_cut_at_out is not None:
+                    filter_chains.append(f"[{audio_src}]{audio_filter},asplit=2[aat1][aat2]")
+                    filter_chains.append(f"[aat1]atrim=0:{ad_cut_at_out:.3f},asetpts=PTS-STARTPTS[apa1]")
+                    filter_chains.append(f"[aat2]atrim=start={ad_cut_at_out:.3f},asetpts=PTS-STARTPTS[apa2]")
+                    filter_chains.append(f"[{ad_a_idx}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[aada]")
+                    filter_chains.append("[apa1][aada][apa2]concat=n=3:v=0:a=1[a_out]")
+                else:
+                    filter_chains.append(f"[{audio_src}]{audio_filter}[a_out]")
                 cmd_final = [self.ffmpeg_bin, "-y"] + inputs + [
                     "-filter_complex", ";".join(filter_chains),
                     "-map", f"[{cur_v}]",
@@ -2606,6 +2762,89 @@ class UnifiedDotaStudioApp:
                 self.root.after(0, self.set_busy, False)
         threading.Thread(target=worker, daemon=True).start()
 
+    # ---------------- ВКЛАДКА 7: ВСТАВКА РЕКЛАМЫ ----------------
+    def build_ad_tab(self):
+        f_box = ttk.LabelFrame(self.tab_ads, text=" 1. Файлы ", padding="8"); f_box.pack(fill=tk.X, pady=4)
+
+        ttk.Label(f_box, text="Исходное видео:").grid(row=0, column=0, sticky=tk.W)
+        self.ad_src_entry = ttk.Entry(f_box, width=58); self.ad_src_entry.grid(row=0, column=1, padx=5, pady=2, sticky=tk.EW)
+        ttk.Button(f_box, text="Обзор...", command=self.browse_ad_src).grid(row=0, column=2)
+
+        ttk.Label(f_box, text="Рекламный ролик:").grid(row=1, column=0, sticky=tk.W)
+        self.ad_file_entry = ttk.Entry(f_box, width=58); self.ad_file_entry.grid(row=1, column=1, padx=5, pady=2, sticky=tk.EW)
+        ttk.Button(f_box, text="Обзор...", command=self.browse_ad_file).grid(row=1, column=2)
+
+        ttk.Label(f_box, text="Куда сохранить:").grid(row=2, column=0, sticky=tk.W)
+        self.ad_out_entry = ttk.Entry(f_box, width=58); self.ad_out_entry.grid(row=2, column=1, padx=5, pady=2, sticky=tk.EW)
+        ttk.Button(f_box, text="Обзор...", command=self.browse_ad_out).grid(row=2, column=2)
+        f_box.columnconfigure(1, weight=1)
+
+        t_box = ttk.LabelFrame(self.tab_ads, text=" 2. Тайминг вставки ", padding="8"); t_box.pack(fill=tk.X, pady=4)
+        t_row = ttk.Frame(t_box); t_row.pack(fill=tk.X)
+        ttk.Label(t_row, text="Вставить на:").pack(side=tk.LEFT)
+        self.ad_time_entry = ttk.Entry(t_row, width=12); self.ad_time_entry.insert(0, "01:00"); self.ad_time_entry.pack(side=tk.LEFT, padx=6)
+        ttk.Label(t_row, text="(мм:сс или чч:мм:сс)").pack(side=tk.LEFT)
+        ttk.Label(t_box, text="Ролик встанет на указанной секунде и растянет видео на свою длину. Всё одним проходом.",
+                  font=("Arial", 8, "italic"), foreground="#00aa00").pack(anchor=tk.W, pady=(4, 0))
+
+        self.btn_run_ad = ttk.Button(self.tab_ads, text="📢 ВСТАВИТЬ РЕКЛАМУ", command=self.start_ad_insert)
+        self.btn_run_ad.pack(fill=tk.X, pady=10, ipady=6)
+
+    def browse_ad_src(self):
+        fn = filedialog.askopenfilename(title="Выберите видео", filetypes=[("Видео", "*.mp4 *.mkv *.mov *.avi"), ("Все", "*.*")])
+        if fn:
+            self.ad_src_entry.delete(0, tk.END); self.ad_src_entry.insert(0, os.path.normpath(fn))
+            d, b = os.path.split(fn); name, _ = os.path.splitext(b)
+            self.ad_out_entry.delete(0, tk.END); self.ad_out_entry.insert(0, os.path.normpath(os.path.join(d, f"{name}_WITH_AD.mp4")))
+            self.save_settings()
+
+    def browse_ad_file(self):
+        fn = filedialog.askopenfilename(title="Выберите рекламный ролик", filetypes=[("Видео", "*.mp4 *.mov *.mkv"), ("Все", "*.*")])
+        if fn:
+            self.ad_file_entry.delete(0, tk.END); self.ad_file_entry.insert(0, os.path.normpath(fn))
+            self.save_settings()
+
+    def browse_ad_out(self):
+        fn = filedialog.asksaveasfilename(title="Сохранить как", defaultextension=".mp4", filetypes=[("MP4", "*.mp4")])
+        if fn:
+            self.ad_out_entry.delete(0, tk.END); self.ad_out_entry.insert(0, os.path.normpath(fn))
+            self.save_settings()
+
+    def browse_ad_cut_file(self):
+        fn = filedialog.askopenfilename(title="Выберите рекламный ролик", filetypes=[("Видео", "*.mp4 *.mov *.mkv"), ("Все", "*.*")])
+        if fn:
+            self.ad_cut_entry.delete(0, tk.END); self.ad_cut_entry.insert(0, os.path.normpath(fn))
+            self.ad_cut_var.set(True)
+            self.save_settings()
+
+    def start_ad_insert(self):
+        self.save_settings()
+        src = self.ad_src_entry.get().strip()
+        ad = self.ad_file_entry.get().strip()
+        out = self.ad_out_entry.get().strip()
+        if not src or not os.path.exists(src): messagebox.showerror("Ошибка", "Выберите исходное видео!"); return
+        if not ad or not os.path.exists(ad): messagebox.showerror("Ошибка", "Выберите рекламный ролик!"); return
+        if not out: messagebox.showerror("Ошибка", "Укажите куда сохранить!"); return
+        at = parse_time_str(self.ad_time_entry.get())
+        if at is None: messagebox.showerror("Ошибка", "Тайминг в формате 01:00 или 00:01:00"); return
+
+        out_dir = os.path.dirname(os.path.abspath(out))
+        if out_dir: os.makedirs(out_dir, exist_ok=True)
+
+        self.set_busy(True)
+        def worker():
+            try:
+                self.log(f"[РЕКЛАМА] Вставка на {format_time_hms(at)}...")
+                insert_ad_at(src, ad, at, out, self.ffmpeg_bin, log_callback=self.log)
+                self.log(f"[РЕКЛАМА] Готово: {out}")
+                self.root.after(0, lambda: messagebox.showinfo("Готово!", f"Реклама вставлена:\n{out}"))
+            except Exception as e:
+                self.log(f"[ОШИБКА] {e}")
+                self.root.after(0, lambda msg=str(e): messagebox.showerror("Ошибка", msg))
+            finally:
+                self.root.after(0, self.set_busy, False)
+        threading.Thread(target=worker, daemon=True).start()
+
     # ---------------- УМНЫЙ ЦЕНЗОР WHISPER ----------------
     def mute_audio_data(self, video_path, swear_file_path):
         if not WHISPER_AVAILABLE:
@@ -2865,10 +3104,12 @@ class UnifiedDotaStudioApp:
             self.btn_run_cutter.config(state=tk.DISABLED); self.btn_run_react.config(state=tk.DISABLED)
             self.btn_run_censor_only.config(state=tk.DISABLED); self.btn_run_single_overlay.config(state=tk.DISABLED)
             self.btn_run_clips.config(state=tk.DISABLED); self.btn_run_shorts.config(state=tk.DISABLED)
+            if hasattr(self, "btn_run_ad"): self.btn_run_ad.config(state=tk.DISABLED)
             self.progress_bar.start(10)
         else:
             self.btn_run_cutter.config(state=tk.NORMAL); self.btn_run_react.config(state=tk.NORMAL)
             self.btn_run_censor_only.config(state=tk.NORMAL); self.btn_run_single_overlay.config(state=tk.NORMAL)
+            if hasattr(self, "btn_run_ad"): self.btn_run_ad.config(state=tk.NORMAL)
             self.btn_run_clips.config(state=tk.NORMAL); self.btn_run_shorts.config(state=tk.NORMAL)
             self.progress_bar.stop()
 
