@@ -7,6 +7,8 @@ import subprocess
 import threading
 import time
 import tempfile
+import urllib.request
+import urllib.error
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import numpy as np
@@ -1010,6 +1012,127 @@ def build_clips_compilation(clip_items, out_path, ffmpeg_bin, titles=True, fade=
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return out_path
 
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+
+def deepseek_chat(prompt, api_key, system=None, model="deepseek-chat", max_tokens=2000, timeout=120):
+    """Запрос к DeepSeek (OpenAI-совместимый API). Без сторонних библиотек."""
+    key = (api_key or "").strip()
+    if not key:
+        raise RuntimeError("Не указан ключ DeepSeek — впиши его в поле или задай DEEPSEEK_API_KEY")
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    body = json.dumps({
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(DEEPSEEK_URL, data=body, headers={
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        if e.code == 401:
+            raise RuntimeError("DeepSeek: неверный ключ (401)")
+        if e.code == 402:
+            raise RuntimeError("DeepSeek: на балансе нет денег (402)")
+        raise RuntimeError(f"DeepSeek вернул {e.code}: {detail or e.reason}")
+    except Exception as e:
+        raise RuntimeError(f"Нет связи с DeepSeek: {e}")
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        raise RuntimeError("DeepSeek ответил неожиданным форматом")
+
+def transcribe_segments(video_path, log=None):
+    """Расшифровка речи с таймкодами: список (секунды, текст)."""
+    if not WHISPER_AVAILABLE:
+        raise RuntimeError("faster-whisper не установлен — расшифровать нечем")
+    ff = find_ffmpeg()
+    tmp_wav = os.path.join(TEMP_DIR, f"desc_{int(time.time()*1000)}.wav")
+    subprocess.run([ff, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
+                    "-ar", "16000", "-ac", "1", tmp_wav], capture_output=True)
+    if not os.path.exists(tmp_wav):
+        raise RuntimeError("Не удалось вытащить звук из видео")
+    has_cuda = False
+    try:
+        import torch
+        has_cuda = torch.cuda.is_available()
+    except Exception:
+        pass
+    try:
+        if log:
+            log("[ОПИСАНИЕ] Распознаю речь (это самый долгий шаг)...")
+        model = WhisperModel("base", device="cuda" if has_cuda else "cpu",
+                             compute_type="float16" if has_cuda else "int8", cpu_threads=4)
+        segments, _ = model.transcribe(tmp_wav, language="ru", vad_filter=True, beam_size=1)
+        rows = []
+        for s in segments:
+            txt = (s.text or "").strip()
+            if txt:
+                rows.append((s.start, txt))
+    finally:
+        try:
+            os.remove(tmp_wav)
+        except Exception:
+            pass
+    if log:
+        log(f"[ОПИСАНИЕ] Распознано фрагментов: {len(rows)}")
+    return rows
+
+def make_description(video_path, out_path, api_key, log=None, max_chars=30000):
+    """Расшифровка -> DeepSeek -> текстовый файл с заголовком, описанием, тегами и главами."""
+    rows = transcribe_segments(video_path, log)
+    if not rows:
+        raise RuntimeError("Речь не распознана — отправлять нечего")
+
+    text = "\n".join(f"[{format_time_hms(t)}] {x}" for t, x in rows)
+    if len(text) > max_chars:
+        text = text[:max_chars - 8000] + "\n...(середина пропущена)...\n" + text[-7000:]
+
+    prompt = (
+        "Ниже расшифровка готового YouTube-ролика с нарезками стримов Dota 2 "
+        "(стример Daxak, канал «Бородка Дахака»).\n\n"
+        "Сделай оформление для публикации.\n\n"
+        "Требования:\n"
+        "- Заголовок: до 90 символов, по-русски, цепляющий, но без обмана.\n"
+        "- Описание: 2-3 абзаца по 2-3 предложения, живым языком, без воды и без выдумок.\n"
+        "- Хэштеги: 12-15 штук через пробел, по теме Dota 2.\n"
+        "- Главы: 5-10 штук, формат «ММ:СС Название», первая строго «00:00 ...». "
+        "Таймкоды бери из расшифровки, не выдумывай.\n\n"
+        "Ответ строго в таком виде, без пояснений:\n"
+        "ЗАГОЛОВОК: ...\n"
+        "ОПИСАНИЕ:\n...\n"
+        "ХЭШТЕГИ: ...\n"
+        "ГЛАВЫ:\n00:00 ...\n\n"
+        f"РАСШИФРОВКА:\n{text}"
+    )
+
+    if log:
+        log("[ОПИСАНИЕ] Отправляю в DeepSeek...")
+    answer = deepseek_chat(prompt, api_key,
+                           system="Ты редактор YouTube-канала с нарезками Dota 2. Пишешь по-русски, коротко и по делу.")
+    answer = (answer or "").strip()
+    if not answer:
+        raise RuntimeError("DeepSeek вернул пустой ответ")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(answer + "\n")
+    if log:
+        log(f"[ОПИСАНИЕ] Готово: {os.path.basename(out_path)}")
+    return answer
+
 # ==================== ГРАФИЧЕСКИЙ ИНТЕРФЕЙС ====================
 class UnifiedDotaStudioApp:
     def __init__(self, root):
@@ -1049,6 +1172,7 @@ class UnifiedDotaStudioApp:
         self.tab_censor = self._add_scrollable_tab(" 🔇 5. Цензура ")
         self.tab_overlay = self._add_scrollable_tab(" 🖼 6. Баннер ")
         self.tab_ads = self._add_scrollable_tab(" 📢 7. Реклама ")
+        self.tab_desc = self._add_scrollable_tab(" 🤖 8. Описание ")
 
         self.build_cutter_tab()
         self.build_react_tab()
@@ -1057,6 +1181,7 @@ class UnifiedDotaStudioApp:
         self.build_censor_tab()
         self.build_overlay_tab()
         self.build_ad_tab()
+        self.build_desc_tab()
 
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
 
@@ -1227,6 +1352,9 @@ class UnifiedDotaStudioApp:
             "ad_file": _get("ad_file_entry"),
             "ad_out": _get("ad_out_entry"),
             "ad_time": _get("ad_time_entry", "01:00"),
+            "desc_video": _get("desc_video_entry"),
+            "desc_out": _get("desc_out_entry"),
+            "deepseek_key": _get("deepseek_key_entry"),
 
             # Реакции
             "react_input": _get("react_input_entry"),
@@ -1370,6 +1498,9 @@ class UnifiedDotaStudioApp:
             _set_entry("ad_file_entry", c.get("ad_file", ""))
             _set_entry("ad_out_entry", c.get("ad_out", ""))
             _set_entry("ad_time_entry", c.get("ad_time", "01:00"))
+            _set_entry("desc_video_entry", c.get("desc_video", ""))
+            _set_entry("desc_out_entry", c.get("desc_out", ""))
+            _set_entry("deepseek_key_entry", c.get("deepseek_key", ""))
 
             _t = str(c.get("temp_dir", "") or "").strip()
             if _t and os.path.isdir(_t) and hasattr(self, "temp_dir_var"):
@@ -3127,6 +3258,80 @@ class UnifiedDotaStudioApp:
                 self.root.after(0, self.set_busy, False)
         threading.Thread(target=worker, daemon=True).start()
 
+    # ---------------- ВКЛАДКА 8: ОПИСАНИЕ ЧЕРЕЗ DEEPSEEK ----------------
+    def build_desc_tab(self):
+        d_box = ttk.LabelFrame(self.tab_desc, text=" 1. Готовый ролик ", padding="8"); d_box.pack(fill=tk.X, pady=4)
+
+        ttk.Label(d_box, text="Видео:").grid(row=0, column=0, sticky=tk.W)
+        self.desc_video_entry = ttk.Entry(d_box, width=58); self.desc_video_entry.grid(row=0, column=1, padx=5, pady=2, sticky=tk.EW)
+        ttk.Button(d_box, text="Обзор...", command=self.browse_desc_video).grid(row=0, column=2)
+
+        ttk.Label(d_box, text="Куда сохранить:").grid(row=1, column=0, sticky=tk.W)
+        self.desc_out_entry = ttk.Entry(d_box, width=58); self.desc_out_entry.grid(row=1, column=1, padx=5, pady=2, sticky=tk.EW)
+        ttk.Button(d_box, text="Обзор...", command=self.browse_desc_out).grid(row=1, column=2)
+        d_box.columnconfigure(1, weight=1)
+
+        k_box = ttk.LabelFrame(self.tab_desc, text=" 2. DeepSeek ", padding="8"); k_box.pack(fill=tk.X, pady=4)
+        k_row = ttk.Frame(k_box); k_row.pack(fill=tk.X, pady=2)
+        ttk.Label(k_row, text="API-ключ:").pack(side=tk.LEFT)
+        self.deepseek_key_entry = ttk.Entry(k_row, width=46, show="*"); self.deepseek_key_entry.pack(side=tk.LEFT, padx=5)
+        self.deepseek_show_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(k_row, text="показать", variable=self.deepseek_show_var,
+                        command=lambda: self.deepseek_key_entry.config(show="" if self.deepseek_show_var.get() else "*")).pack(side=tk.LEFT)
+        ttk.Label(k_box, text="Ключ берётся из поля или из переменной DEEPSEEK_API_KEY. Хранится в studio_config.json локально.",
+                  font=("Arial", 8, "italic"), foreground="#00aa00").pack(anchor=tk.W, pady=(4, 0))
+
+        self.btn_run_desc = ttk.Button(self.tab_desc, text="🤖 СГЕНЕРИРОВАТЬ ЗАГОЛОВОК, ОПИСАНИЕ И ГЛАВЫ",
+                                       command=self.start_desc_pipeline)
+        self.btn_run_desc.pack(fill=tk.X, pady=10, ipady=6)
+
+    def browse_desc_video(self):
+        fn = filedialog.askopenfilename(title="Выберите готовый ролик", filetypes=[("Видео", "*.mp4 *.mkv *.mov"), ("Все", "*.*")])
+        if fn:
+            self.desc_video_entry.delete(0, tk.END); self.desc_video_entry.insert(0, os.path.normpath(fn))
+            d, b = os.path.split(fn); name, _ = os.path.splitext(b)
+            self.desc_out_entry.delete(0, tk.END); self.desc_out_entry.insert(0, os.path.normpath(os.path.join(d, f"{name}_описание.txt")))
+            self.save_settings()
+
+    def browse_desc_out(self):
+        fn = filedialog.asksaveasfilename(title="Сохранить описание", defaultextension=".txt", filetypes=[("Текст", "*.txt")])
+        if fn:
+            self.desc_out_entry.delete(0, tk.END); self.desc_out_entry.insert(0, os.path.normpath(fn))
+            self.save_settings()
+
+    def start_desc_pipeline(self):
+        self.save_settings()
+        vid = self.desc_video_entry.get().strip()
+        out = self.desc_out_entry.get().strip()
+        if not vid or not os.path.exists(vid): messagebox.showerror("Ошибка", "Выберите готовый ролик!"); return
+        if not out: messagebox.showerror("Ошибка", "Укажите куда сохранить описание!"); return
+        if not WHISPER_AVAILABLE:
+            messagebox.showerror("Ошибка", "faster-whisper не установлен — расшифровать нечем"); return
+        key = (self.deepseek_key_entry.get().strip() or os.environ.get("DEEPSEEK_API_KEY", "").strip())
+        if not key:
+            messagebox.showerror("Ошибка", "Впиши API-ключ DeepSeek или задай DEEPSEEK_API_KEY"); return
+
+        out_dir = os.path.dirname(os.path.abspath(out))
+        if out_dir: os.makedirs(out_dir, exist_ok=True)
+
+        self.set_busy(True)
+        def worker():
+            try:
+                answer = make_description(vid, out, key, self.log)
+                self.log("=" * 60)
+                for line in answer.splitlines():
+                    self.log(line)
+                self.log("=" * 60)
+                self.root.after(0, lambda: messagebox.showinfo("Готово!", f"Описание сохранено:\n{out}"))
+                try: os.startfile(out)
+                except Exception: pass
+            except Exception as e:
+                self.log(f"[ОШИБКА] {e}")
+                self.root.after(0, lambda msg=str(e): messagebox.showerror("Ошибка", msg))
+            finally:
+                self.root.after(0, self.set_busy, False)
+        threading.Thread(target=worker, daemon=True).start()
+
     # ---------------- УМНЫЙ ЦЕНЗОР WHISPER ----------------
     def mute_audio_data(self, video_path, swear_file_path):
         if not WHISPER_AVAILABLE:
@@ -3387,11 +3592,13 @@ class UnifiedDotaStudioApp:
             self.btn_run_censor_only.config(state=tk.DISABLED); self.btn_run_single_overlay.config(state=tk.DISABLED)
             self.btn_run_clips.config(state=tk.DISABLED); self.btn_run_shorts.config(state=tk.DISABLED)
             if hasattr(self, "btn_run_ad"): self.btn_run_ad.config(state=tk.DISABLED)
+            if hasattr(self, "btn_run_desc"): self.btn_run_desc.config(state=tk.DISABLED)
             self.progress_bar.start(10)
         else:
             self.btn_run_cutter.config(state=tk.NORMAL); self.btn_run_react.config(state=tk.NORMAL)
             self.btn_run_censor_only.config(state=tk.NORMAL); self.btn_run_single_overlay.config(state=tk.NORMAL)
             if hasattr(self, "btn_run_ad"): self.btn_run_ad.config(state=tk.NORMAL)
+            if hasattr(self, "btn_run_desc"): self.btn_run_desc.config(state=tk.NORMAL)
             self.btn_run_clips.config(state=tk.NORMAL); self.btn_run_shorts.config(state=tk.NORMAL)
             self.progress_bar.stop()
 
