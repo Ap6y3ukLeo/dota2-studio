@@ -765,6 +765,138 @@ def download_top_twitch_clips_ytdlp(channel_name, range_code, limit, temp_dir, l
 
     return results
 
+def _ff_path(p):
+    """Путь для фильтра ffmpeg: прямые слэши и экранированное двоеточие диска."""
+    return "'" + os.path.abspath(p).replace("\\", "/").replace(":", r"\:") + "'"
+
+def detect_banner_box(ffmpeg_bin, path):
+    """Плашка букмекера сверху кадра: авто-поиск, иначе проверка стандартного места. Координаты исходника."""
+    if not CV2_AVAILABLE or not os.path.exists(path):
+        return None
+    try:
+        cap = cv2.VideoCapture(path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * 0.3))
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            return None
+        H, W = frame.shape[:2]
+
+        box = detect_fonbet_box_single_frame(frame)
+        if box:
+            x, y, bw, bh = box
+            # плашка стримера живёт сверху справа, а не в гуще драки
+            if (y + bh / 2.0) <= H * 0.22 and (x + bw / 2.0) >= W * 0.45:
+                return box
+
+        fx, fy, fw, fh = int(W * 0.823), int(H * 0.028), int(W * 0.151), int(H * 0.065)
+        roi = frame[fy:fy + fh, fx:fx + fw]
+        if roi.size:
+            b, g, r = roi[:, :, 0].astype(int), roi[:, :, 1].astype(int), roi[:, :, 2].astype(int)
+            red = ((r > 110) & (r - g > 45) & (r - b > 45)).mean()
+            if red > 0.18:
+                return (fx, fy, fw, fh)
+        return None
+    except Exception:
+        return None
+
+def build_clips_compilation(clip_items, out_path, ffmpeg_bin, titles=True, fade=True,
+                            overlay_png=None, log=None):
+    """Нормализует клипы, накладывает титры и заглушку баннера, склеивает в один ролик."""
+    if not clip_items:
+        raise RuntimeError("Клипы не скачались")
+
+    W, H, fps, _, _ = probe_media(ffmpeg_bin, clip_items[0]["path"])
+    W, H = W or 1920, H or 1080
+    fps = fps or 60
+
+    tmp_dir = os.path.join(TEMP_DIR, "clips_norm")
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    logo = None
+    if overlay_png and os.path.exists(overlay_png):
+        logo = remove_fake_checkerboard_transparency(overlay_png, log)
+
+    font_file = "C\\:/Windows/Fonts/arialbd.ttf"
+    if not os.path.exists("C:/Windows/Fonts/arialbd.ttf"):
+        font_file = find_system_font()
+
+    names = []
+    for i, item in enumerate(clip_items):
+        path = item["path"]
+        title = " ".join((item.get("title") or "").split())
+        src_w, src_h, _, has_audio, dur = probe_media(ffmpeg_bin, path)
+        dur = dur or 0.0
+        src_w, src_h = src_w or W, src_h or H
+
+        inputs = ["-i", path]
+        chains = [f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={fps:g}[base]"]
+        cur = "base"
+        title_y = 40
+
+        if logo:
+            box = detect_banner_box(ffmpeg_bin, path)
+            if box:
+                bx, by, bw, bh = box
+                bx, by = int(bx * W / src_w), int(by * H / src_h)
+                bw, bh = int(bw * W / src_w), int(bh * H / src_h)
+                tw, th = int(bw * 1.5), int(bh * 1.5)
+                px = max(0, min(W - tw, bx + bw // 2 - tw // 2))
+                py = max(0, min(H - th, by + bh // 2 - th // 2))
+                inputs += ["-i", logo]
+                chains.append(f"[1:v]scale={tw}:{th}[logo]")
+                chains.append(f"[{cur}][logo]overlay={px}:{py}[ov]")
+                cur = "ov"
+                title_y = min(H - 120, py + th + 24)
+
+        if titles and title:
+            tf = os.path.join(tmp_dir, f"title_{i:03d}.txt")
+            with open(tf, "w", encoding="utf-8") as f:
+                f.write(title[:80])
+            fs = max(26, int(H * 0.042))
+            chains.append(
+                f"[{cur}]drawtext=fontfile='{font_file}':textfile={_ff_path(tf)}:"
+                f"fontcolor=white:fontsize={fs}:x=w-tw-40:y={title_y}:"
+                f"box=1:boxcolor=black@0.6:boxborderw=14:fix_bounds=1[txt]"
+            )
+            cur = "txt"
+
+        if fade and dur > 1.2:
+            chains.append(f"[{cur}]fade=t=in:st=0:d=0.2,fade=t=out:st={max(0.0, dur - 0.2):.2f}:d=0.2[v]")
+            cur = "v"
+
+        a_idx = "0:a"
+        if not has_audio:
+            a_idx = str(len(inputs) // 2)
+            inputs += ["-f", "lavfi", "-t", f"{max(3.0, dur):.3f}", "-i", "anullsrc=r=44100:cl=stereo"]
+
+        name = f"norm_{i:03d}.mkv"
+        cmd = [ffmpeg_bin, "-y"] + inputs + [
+            "-filter_complex", ";".join(chains), "-map", f"[{cur}]", "-map", a_idx,
+        ] + video_enc_args(ffmpeg_bin, "ultrafast", 22, fps) + [
+            "-c:a", "aac", "-b:a", "192k", "-shortest", os.path.join(tmp_dir, name)
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        if r.returncode != 0:
+            raise RuntimeError(f"Клип {i + 1} не обработался:\n{r.stderr.strip()[-300:]}")
+        names.append(name)
+        if log:
+            log(f"[КЛИПЫ] {i + 1}/{len(clip_items)} готов" + (f": {title[:40]}" if title else ""))
+
+    with open(os.path.join(tmp_dir, "list.txt"), "w", encoding="utf-8") as f:
+        for n in names:
+            f.write(f"file '{n}'\n")
+    r = subprocess.run([ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", "list.txt",
+                        "-c", "copy", os.path.abspath(out_path)],
+                       cwd=tmp_dir, capture_output=True, text=True, errors="replace")
+    if r.returncode != 0:
+        raise RuntimeError("Не удалось склеить клипы:\n" + r.stderr.strip()[-300:])
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return out_path
+
 # ==================== ГРАФИЧЕСКИЙ ИНТЕРФЕЙС ====================
 class UnifiedDotaStudioApp:
     def __init__(self, root):
@@ -2447,9 +2579,25 @@ class UnifiedDotaStudioApp:
         self.save_settings()
         ch = self.clips_channel_entry.get().strip() or "daxak"
         out = self.clips_out_entry.get().strip()
-        range_code = "30d" if "месяц" in self.clips_period_combo.get() else "7d"
+        period = self.clips_period_combo.get()
+        range_code = "7d" if "недел" in period else ("all" if "все время" in period else "30d")
         limit = int(self.clips_count_spin.get())
         if not out: messagebox.showerror("Ошибка", "Укажите имя для сохранения!"); return
+
+        do_titles = self.clips_titles_var.get()
+        do_fade = self.clips_fade_var.get()
+        do_censor = self.clips_censor_var.get()
+        sw_file = self.clips_swears_entry.get().strip()
+        do_overlay = self.clips_overlay_var.get()
+        png = self.clips_png_entry.get().strip()
+
+        if do_overlay and (not png or not os.path.exists(png)):
+            messagebox.showerror("Ошибка", "PNG для закрытия баннера не найден!"); return
+        if do_censor and WHISPER_AVAILABLE and (not sw_file or not os.path.exists(sw_file)):
+            messagebox.showerror("Ошибка", "Словарь матов не найден!"); return
+
+        out_dir = os.path.dirname(os.path.abspath(out))
+        if out_dir: os.makedirs(out_dir, exist_ok=True)
 
         self.set_busy(True)
         def worker():
@@ -2457,10 +2605,27 @@ class UnifiedDotaStudioApp:
             try:
                 clip_items = download_top_twitch_clips_ytdlp(ch, range_code, limit, temp_dir, self.log)
                 if not clip_items: raise RuntimeError("Не удалось скачать клипы.")
-                concat_list = os.path.join(temp_dir, "list.txt")
-                with open(concat_list, "w", encoding="utf-8") as f:
-                    for item in clip_items: f.write(f"file '{os.path.basename(item['path'])}'\n")
-                subprocess.run([self.ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy", out], cwd=temp_dir, capture_output=True)
+
+                self.log(f"[КЛИПЫ] Скачано {len(clip_items)}. Накладываю титры и собираю сборник...")
+                build_clips_compilation(clip_items, out, self.ffmpeg_bin,
+                                        titles=do_titles, fade=do_fade,
+                                        overlay_png=png if do_overlay else None, log=self.log)
+
+                if do_censor and WHISPER_AVAILABLE:
+                    self.log("[КЛИПЫ] Заглушка матов...")
+                    clean_wav, muted = self.mute_audio_data(out, sw_file)
+                    if clean_wav and os.path.exists(clean_wav):
+                        tmp_out = out + ".muted.mp4"
+                        r = subprocess.run([self.ffmpeg_bin, "-y", "-i", out, "-i", clean_wav,
+                                            "-map", "0:v:0", "-map", "1:a:0",
+                                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                                            "-shortest", tmp_out], capture_output=True, text=True, errors="replace")
+                        if r.returncode == 0:
+                            os.replace(tmp_out, out)
+                        try: os.remove(clean_wav)
+                        except: pass
+                        self.log(f"[КЛИПЫ] Заглушено матов: {muted}")
+
                 self.log(f"[УСПЕХ] Сборник готов: {out}")
                 self.root.after(0, lambda: messagebox.showinfo("Готово!", "Клипы собраны!"))
             except Exception as e:
