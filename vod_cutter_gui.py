@@ -1156,9 +1156,10 @@ def _fix_chapters(answer, chapters):
         out.append(f"{format_time_hms(t)} {names[idx] if idx < len(names) else default_name}")
     return "\n".join(out).rstrip()
 
-def make_description(video_path, out_path, api_key, log=None, max_chars=30000):
+def make_description(video_path, out_path, api_key, log=None, max_chars=30000, rows=None):
     """Расшифровка -> DeepSeek -> текстовый файл с заголовком, описанием, тегами и главами."""
-    rows = transcribe_segments(video_path, log)
+    if rows is None:
+        rows = transcribe_segments(video_path, log)
     if not rows:
         raise RuntimeError("Речь не распознана — отправлять нечего")
 
@@ -1214,6 +1215,54 @@ def make_description(video_path, out_path, api_key, log=None, max_chars=30000):
         f.write(answer + "\n")
     if log:
         log(f"[ОПИСАНИЕ] Готово: {os.path.basename(out_path)}")
+    return answer
+
+TG_EXAMPLES = (
+    "— «Хз чё здесь будет»\n"
+    "— «Как по мне новая стрижка даксака это пиздец, почему он не носит старую с длинными волосами?»\n"
+    "— «Сегодня дахак играет на стримерском турнире, нарезку ждите завтра, не успею нарезать. Ну или ночью»\n"
+    "— «дахак проиграл быстро, ждите нарезку»\n"
+    "— «сегодня дахак против стрея в 17:30, нарезку ждите ночью-утром»\n"
+    "— «Собрал топ клипы дахака за Октябрь! Приятного просмотра»\n"
+)
+
+def make_tg_post(video_path, out_path, api_key, log=None, rows=None, max_chars=20000, context=""):
+    """Три варианта поста в Telegram в стиле канала — по тому, что происходит в ролике."""
+    if rows is None:
+        rows = transcribe_segments(video_path, log)
+    if not rows:
+        raise RuntimeError("Речь не распознана — писать не о чем")
+
+    text = "\n".join(f"[{format_time_hms(t)}] {x}" for t, x in rows)
+    if len(text) > max_chars:
+        text = text[:max_chars - 6000] + "\n...(середина пропущена)...\n" + text[-5000:]
+
+    prompt = (
+        "Ты ведёшь Telegram-канал «барбер шоп дахака» с нарезками стримов Dota 2 (стример Daxak).\n\n"
+        "Так ты обычно пишешь:\n" + TG_EXAMPLES + "\n"
+        "Стиль: 1-2 предложения, строчными буквами, живая речь, без эмодзи и хэштегов, "
+        "мат допустим, без пафоса и без выдуманных фактов. Часто зовёшь ждать нарезку.\n\n"
+        "Составь 3 варианта поста к новому ролику — от спокойного к самому развязному. "
+        "Каждый с новой строки, начни с «1) », «2) », «3) ». Больше ничего не пиши.\n\n"
+        f"ЧТО ПРОИСХОДИТ В РОЛИКЕ:\n{text}"
+    )
+    if (context or "").strip():
+        prompt += ("\n\nФАКТЫ ОТ АВТОРА (используй их как данность, ничего не додумывай сверх этого):\n"
+                   + context.strip())
+
+    if log:
+        log("[ТГ] Придумываю посты в стиле канала...")
+    answer = deepseek_chat(prompt, api_key,
+                           system="Ты автор Telegram-канала с нарезками Dota 2. Пишешь коротко, по-русски, "
+                                  "живым языком, как в своих примерах. Без эмодзи.")
+    answer = (answer or "").strip()
+    if not answer:
+        raise RuntimeError("DeepSeek вернул пустой ответ")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(answer + "\n")
+    if log:
+        log(f"[ТГ] Готово: {os.path.basename(out_path)}")
     return answer
 
 # ==================== ГРАФИЧЕСКИЙ ИНТЕРФЕЙС ====================
@@ -1438,6 +1487,7 @@ class UnifiedDotaStudioApp:
             "desc_video": _get("desc_video_entry"),
             "desc_out": _get("desc_out_entry"),
             "deepseek_key": _get("deepseek_key_entry"),
+            "desc_context": _get("desc_context_entry"),
 
             # Реакции
             "react_input": _get("react_input_entry"),
@@ -1584,6 +1634,7 @@ class UnifiedDotaStudioApp:
             _set_entry("desc_video_entry", c.get("desc_video", ""))
             _set_entry("desc_out_entry", c.get("desc_out", ""))
             _set_entry("deepseek_key_entry", c.get("deepseek_key", ""))
+            _set_entry("desc_context_entry", c.get("desc_context", ""))
 
             _t = str(c.get("temp_dir", "") or "").strip()
             if _t and os.path.isdir(_t) and hasattr(self, "temp_dir_var"):
@@ -3364,7 +3415,20 @@ class UnifiedDotaStudioApp:
         ttk.Label(k_box, text="Ключ берётся из поля или из переменной DEEPSEEK_API_KEY. Хранится в studio_config.json локально.",
                   font=("Arial", 8, "italic"), foreground="#00aa00").pack(anchor=tk.W, pady=(4, 0))
 
-        self.btn_run_desc = ttk.Button(self.tab_desc, text="🤖 СГЕНЕРИРОВАТЬ ЗАГОЛОВОК, ОПИСАНИЕ И ГЛАВЫ",
+        m_box = ttk.LabelFrame(self.tab_desc, text=" 3. Что сгенерировать ", padding="8"); m_box.pack(fill=tk.X, pady=4)
+        self.desc_mode_var = tk.StringVar(value="both")
+        ttk.Radiobutton(m_box, text="Описание для YouTube", value="yt", variable=self.desc_mode_var).pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Radiobutton(m_box, text="Пост в Telegram", value="tg", variable=self.desc_mode_var).pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Radiobutton(m_box, text="Оба (расшифровка считается один раз)", value="both", variable=self.desc_mode_var).pack(side=tk.LEFT)
+
+        c_row = ttk.Frame(m_box); c_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(c_row, text="Свои факты (необязательно):").pack(side=tk.LEFT)
+        self.desc_context_entry = ttk.Entry(c_row, width=52)
+        self.desc_context_entry.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+        ttk.Label(m_box, text="Например: «сегодня против стрея в 17:30, турнир». Модель не выдумывает того, чего нет в ролике.",
+                  font=("Arial", 8, "italic"), foreground="#00aa00").pack(anchor=tk.W, pady=(2, 0))
+
+        self.btn_run_desc = ttk.Button(self.tab_desc, text="🤖 СГЕНЕРИРОВАТЬ",
                                        command=self.start_desc_pipeline)
         self.btn_run_desc.pack(fill=tk.X, pady=10, ipady=6)
 
@@ -3386,28 +3450,47 @@ class UnifiedDotaStudioApp:
         self.save_settings()
         vid = self.desc_video_entry.get().strip()
         out = self.desc_out_entry.get().strip()
+        mode = getattr(self, "desc_mode_var", None).get() if hasattr(self, "desc_mode_var") else "both"
         if not vid or not os.path.exists(vid): messagebox.showerror("Ошибка", "Выберите готовый ролик!"); return
-        if not out: messagebox.showerror("Ошибка", "Укажите куда сохранить описание!"); return
+        if mode in ("yt", "both") and not out:
+            messagebox.showerror("Ошибка", "Укажите куда сохранить описание!"); return
         if not WHISPER_AVAILABLE:
             messagebox.showerror("Ошибка", "faster-whisper не установлен — расшифровать нечем"); return
         key = (self.deepseek_key_entry.get().strip() or os.environ.get("DEEPSEEK_API_KEY", "").strip())
         if not key:
             messagebox.showerror("Ошибка", "Впиши API-ключ DeepSeek или задай DEEPSEEK_API_KEY"); return
 
-        out_dir = os.path.dirname(os.path.abspath(out))
-        if out_dir: os.makedirs(out_dir, exist_ok=True)
+        if out:
+            out_dir = os.path.dirname(os.path.abspath(out))
+            if out_dir: os.makedirs(out_dir, exist_ok=True)
+        tg_out = os.path.splitext(os.path.abspath(vid))[0] + "_тг.txt"
 
         self.set_busy(True)
         def worker():
             try:
-                answer = make_description(vid, out, key, self.log)
-                self.log("=" * 60)
-                for line in answer.splitlines():
-                    self.log(line)
-                self.log("=" * 60)
-                self.root.after(0, lambda: messagebox.showinfo("Готово!", f"Описание сохранено:\n{out}"))
-                try: os.startfile(out)
-                except Exception: pass
+                rows = transcribe_segments(vid, self.log)
+                made = []
+                if mode in ("yt", "both"):
+                    answer = make_description(vid, out, key, self.log, rows=rows)
+                    self.log("=" * 60)
+                    for line in answer.splitlines():
+                        self.log(line)
+                    self.log("=" * 60)
+                    made.append(out)
+                if mode in ("tg", "both"):
+                    answer = make_tg_post(vid, tg_out, key, self.log, rows=rows,
+                                          context=self.desc_context_entry.get().strip() if hasattr(self, "desc_context_entry") else "")
+                    self.log("=" * 60)
+                    for line in answer.splitlines():
+                        self.log(line)
+                    self.log("=" * 60)
+                    made.append(tg_out)
+
+                files = "\n".join(made)
+                self.root.after(0, lambda: messagebox.showinfo("Готово!", f"Сохранено:\n{files}"))
+                for p in made:
+                    try: os.startfile(p)
+                    except Exception: pass
             except Exception as e:
                 self.log(f"[ОШИБКА] {e}")
                 self.root.after(0, lambda msg=str(e): messagebox.showerror("Ошибка", msg))
