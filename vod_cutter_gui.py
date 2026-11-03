@@ -100,11 +100,14 @@ def qsv_available(ffmpeg_bin):
     ok = False
     if not os.environ.get("DOTA2STUDIO_NO_GPU"):
         try:
+            # проверяем ровно те опции, которыми потом реально кодируем:
+            # некоторые драйверы инициализируются, но падают на global_quality
             res = subprocess.run(
                 [ffmpeg_bin, "-hide_banner", "-loglevel", "error",
-                 "-init_hw_device", "qsv=hw",
-                 "-f", "lavfi", "-i", "nullsrc=s=320x180:d=0.2",
-                 "-c:v", "h264_qsv", "-f", "null", "-"],
+                 "-f", "lavfi", "-i", "nullsrc=s=320x180:d=1",
+                 "-c:v", "h264_qsv", "-preset", "veryfast",
+                 "-global_quality", "22", "-look_ahead", "0",
+                 "-f", "null", "-"],
                 capture_output=True, timeout=25
             )
             ok = res.returncode == 0
@@ -135,6 +138,30 @@ def video_enc_args(ffmpeg_bin, preset="ultrafast", crf=22, fps=60):
     if fps:
         args += ["-fps_mode", "cfr", "-r", str(fps)]
     return args
+
+def swap_to_cpu(cmd):
+    """Переписывает команду ffmpeg с h264_qsv на libx264 — для повторной попытки без GPU."""
+    out, i = [], 0
+    while i < len(cmd):
+        if cmd[i] == "-c:v" and i + 1 < len(cmd) and cmd[i + 1] == "h264_qsv":
+            out += ["-c:v", "libx264", "-preset", "ultrafast",
+                    "-tune", "fastdecode", "-threads", "0", "-crf", "22"]
+            i += 2
+            while i < len(cmd) and cmd[i] in ("-preset", "-global_quality", "-look_ahead"):
+                i += 2
+            continue
+        out.append(cmd[i])
+        i += 1
+    return out
+
+def ffmpeg_run(cmd, ffmpeg_bin, log=None):
+    """Запуск ffmpeg: если GPU-энкодер отказал — один повтор на CPU, чтобы не терять прогон."""
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if r.returncode != 0 and "h264_qsv" in cmd and use_qsv(ffmpeg_bin):
+        if log:
+            log("[СИСТЕМА] QSV не смог закодировать — повторяю на CPU (libx264)...")
+        r = subprocess.run(swap_to_cpu(cmd), capture_output=True, text=True, errors="replace")
+    return r
 
 def ad_probe(ffmpeg_bin, ad_path):
     """(доля кадра под роликом, доля зелёного фона, длительность) — чтобы выбрать способ вставки."""
@@ -605,7 +632,7 @@ def insert_ad_at(video_path, ad_path, at_sec, out_path, ffmpeg_bin, total_hint=N
     if log_callback:
         run_ffmpeg_with_progress(cmd, total, log_callback)
     else:
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        r = ffmpeg_run(cmd, ffmpeg_bin)
         if r.returncode != 0:
             raise RuntimeError("Не удалось вставить рекламу:\n" + r.stderr.strip()[-400:])
     return out_path
@@ -660,6 +687,16 @@ def generate_cuts_report(report_path, teaser_segs, story_segs, output_video_path
         return None
 
 def run_ffmpeg_with_progress(cmd, total_duration_sec, log_callback):
+    """Рендер с прогрессом; при отказе GPU-энкодера повторяет на CPU."""
+    try:
+        return _run_ffmpeg_progress(cmd, total_duration_sec, log_callback)
+    except RuntimeError:
+        if "h264_qsv" in cmd and use_qsv(find_ffmpeg()):
+            log_callback("[СИСТЕМА] QSV не смог закодировать — повторяю на CPU (libx264)...")
+            return _run_ffmpeg_progress(swap_to_cpu(cmd), total_duration_sec, log_callback)
+        raise
+
+def _run_ffmpeg_progress(cmd, total_duration_sec, log_callback):
     cmd_with_progress = cmd[:-1] + ["-progress", "pipe:1", cmd[-1]]
     err_log_path = os.path.join(TEMP_DIR, "ffmpeg_render_stderr.log")
 
@@ -824,6 +861,8 @@ def build_clips_compilation(clip_items, out_path, ffmpeg_bin, titles=True, fade=
         font_file = find_system_font()
 
     names = []
+    entries = []
+    acc = 0.0
     for i, item in enumerate(clip_items):
         path = item["path"]
         title = " ".join((item.get("title") or "").split())
@@ -878,10 +917,13 @@ def build_clips_compilation(clip_items, out_path, ffmpeg_bin, titles=True, fade=
         ] + video_enc_args(ffmpeg_bin, "ultrafast", 22, fps) + [
             "-c:a", "aac", "-b:a", "192k", "-shortest", os.path.join(tmp_dir, name)
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        r = ffmpeg_run(cmd, ffmpeg_bin, log)
         if r.returncode != 0:
             raise RuntimeError(f"Клип {i + 1} не обработался:\n{r.stderr.strip()[-300:]}")
         names.append(name)
+        real_dur = probe_media(ffmpeg_bin, os.path.join(tmp_dir, name))[4] or dur
+        entries.append((acc, real_dur, title))
+        acc += real_dur
         if log:
             log(f"[КЛИПЫ] {i + 1}/{len(clip_items)} готов" + (f": {title[:40]}" if title else ""))
 
@@ -893,6 +935,21 @@ def build_clips_compilation(clip_items, out_path, ffmpeg_bin, titles=True, fade=
                        cwd=tmp_dir, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         raise RuntimeError("Не удалось склеить клипы:\n" + r.stderr.strip()[-300:])
+
+    report = os.path.splitext(out_path)[0] + "_таймкоды.txt"
+    try:
+        with open(report, "w", encoding="utf-8") as f:
+            f.write("СБОРНИК КЛИПОВ — ТАЙМКОДЫ\n")
+            f.write(f"Файл: {os.path.basename(out_path)}\n")
+            f.write(f"Клипов: {len(entries)}, длительность: {format_time_hms(acc)}\n\n")
+            f.write("ГОТОВЫЕ ГЛАВЫ ДЛЯ ОПИСАНИЯ НА YOUTUBE:\n")
+            for st, d, t in entries:
+                f.write(f"{format_time_hms(st)} - {t or 'клип'} ({format_time_hms(d)})\n")
+        if log:
+            log(f"[КЛИПЫ] Таймкоды: {os.path.basename(report)}")
+    except Exception as e:
+        if log:
+            log(f"[КЛИПЫ] Не удалось записать таймкоды: {e}")
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return out_path
@@ -1893,7 +1950,9 @@ class UnifiedDotaStudioApp:
                 ]
 
                 cmd_cut = [self.ffmpeg_bin, "-y", "-ss", str(ts), "-to", str(te), "-i", video_path] + slice_enc_args + [os.path.join(temp_clips_dir, fn)]
-                subprocess.run(cmd_cut, capture_output=True)
+                res_cut = ffmpeg_run(cmd_cut, self.ffmpeg_bin, self.log)
+                if res_cut.returncode != 0:
+                    raise RuntimeError(f"Кусок {fn} не вырезался:\n{res_cut.stderr.strip()[-300:]}")
                 clip_names.append(fn)
 
                 if do_chat:
@@ -1905,7 +1964,9 @@ class UnifiedDotaStudioApp:
                     cmd_ccut = [self.ffmpeg_bin, "-y", "-ss", str(ts), "-to", str(te), "-i", chat_video_path,
                                 "-vf", chat_vf] + video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60) + [
                                 "-an", os.path.join(temp_chat_clips_dir, cfn)]
-                    subprocess.run(cmd_ccut, capture_output=True)
+                    res_ccut = ffmpeg_run(cmd_ccut, self.ffmpeg_bin, self.log)
+                    if res_ccut.returncode != 0:
+                        raise RuntimeError(f"Чат {cfn} не вырезался:\n{res_ccut.stderr.strip()[-300:]}")
                     chat_clip_names.append(cfn)
 
             if do_tg_intro:
@@ -1913,10 +1974,10 @@ class UnifiedDotaStudioApp:
                 if do_chat:
                     cts = all_story_segments[0][0] if all_story_segments else 0.0
                     cfn = "chat_tg_intro.mkv"
-                    subprocess.run([self.ffmpeg_bin, "-y", "-ss", str(cts), "-to", str(cts + 4.0),
-                                    "-i", chat_video_path, "-vf", "setpts=PTS-STARTPTS"] +
-                                   video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60) + [
-                                    "-an", os.path.join(temp_chat_clips_dir, cfn)], capture_output=True)
+                    ffmpeg_run([self.ffmpeg_bin, "-y", "-ss", str(cts), "-to", str(cts + 4.0),
+                                "-i", chat_video_path, "-vf", "setpts=PTS-STARTPTS"] +
+                               video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60) + [
+                                "-an", os.path.join(temp_chat_clips_dir, cfn)], self.ffmpeg_bin, self.log)
                     chat_clip_names.insert(len(teaser_segments), cfn)
                 self.log(f"[ТГК] Заставка вставлена после хука (после {len(teaser_segments)} роликов).")
 
@@ -2781,7 +2842,7 @@ class UnifiedDotaStudioApp:
                                "-filter_complex", filter_complex, "-map", "[v_out]", "-map", "0:a:0"] + \
                               video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60) + \
                               ["-c:a", "aac", "-b:a", "192k", out_name]
-                    res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+                    res = ffmpeg_run(cmd, self.ffmpeg_bin, self.log)
                     if res.returncode != 0:
                         self.log(f"[ОШИБКА] {os.path.basename(out_name)}: {res.stderr.strip()[-300:]}")
 
