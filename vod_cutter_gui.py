@@ -1226,7 +1226,7 @@ TG_EXAMPLES = (
     "— «Собрал топ клипы дахака за Октябрь! Приятного просмотра»\n"
 )
 
-def deepseek_find_moments(rows, api_key, chunk_sec=480, max_picks=3, log=None):
+def deepseek_find_moments(rows, api_key, chunk_sec=480, log=None):
     """Ищет в расшифровке яркие моменты, которых нет в монтаже. Возвращает [(секунды, причина)]."""
     if not rows:
         return []
@@ -1242,14 +1242,15 @@ def deepseek_find_moments(rows, api_key, chunk_sec=480, max_picks=3, log=None):
         text = "\n".join(f"[{format_time_hms(t)}] {x}" for t, x in block)
         prompt = (
             "Ниже расшифровка куска стрима Dota 2 с таймкодами.\n"
-            "Найди моменты, которые стоит оставить в нарезке: яркая реакция, шутка, конфликт, "
+            "Найди все моменты, которые стоит оставить в нарезке: яркая реакция, шутка, конфликт, "
             "эмоциональный комментарий, что-то смешное или необычное.\n"
-            f"Не больше {max_picks} штук за этот кусок. Только явные моменты, иначе ответь NONE.\n"
+            "Без ограничения по количеству — бери всё, что реально заслуживает внимания. "
+            "Если таких нет, ответь NONE.\n"
             "Формат каждой строки: ММ:СС - причина в 5-8 слов. Больше ничего не пиши.\n\n"
             + text
         )
         try:
-            answer = deepseek_chat(prompt, api_key, max_tokens=400,
+            answer = deepseek_chat(prompt, api_key, max_tokens=1200,
                                    system="Ты монтажёр нарезок Dota 2. Отбираешь только то, что реально интересно зрителю.")
         except Exception as e:
             if log:
@@ -2236,8 +2237,6 @@ class UnifiedDotaStudioApp:
                         picks = deepseek_find_moments(fresh, smart_key, log=self.log)
                         added = 0
                         for pt, why in picks:
-                            if added >= 6:
-                                break
                             seg = [max(m_start, pt - 8.0), min(m_end_c, pt + 12.0)]
                             if any(seg[0] < b and a < seg[1] for a, b in covered):
                                 continue
@@ -2245,6 +2244,8 @@ class UnifiedDotaStudioApp:
                             covered.append(seg)
                             added += 1
                             self.log(f"[ДОБОР] +{format_time_hms(seg[0])} — {why}")
+                        if added:
+                            self.log(f"[ДОБОР] Карта {map_num}: добавлено моментов {added}.")
 
                 # Склейка перекрывающихся сцен
                 raw_intervals = sorted(map_segs, key=lambda x: x['range'][0])
