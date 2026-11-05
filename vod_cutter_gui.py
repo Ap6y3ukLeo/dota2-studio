@@ -1226,6 +1226,50 @@ TG_EXAMPLES = (
     "— «Собрал топ клипы дахака за Октябрь! Приятного просмотра»\n"
 )
 
+def deepseek_find_moments(rows, api_key, chunk_sec=480, max_picks=3, log=None):
+    """Ищет в расшифровке яркие моменты, которых нет в монтаже. Возвращает [(секунды, причина)]."""
+    if not rows:
+        return []
+    picks = []
+    n = len(rows)
+    i = 0
+    while i < n:
+        t0 = rows[i][0]
+        j = i
+        while j < n and rows[j][0] - t0 < chunk_sec:
+            j += 1
+        block = rows[i:j]
+        text = "\n".join(f"[{format_time_hms(t)}] {x}" for t, x in block)
+        prompt = (
+            "Ниже расшифровка куска стрима Dota 2 с таймкодами.\n"
+            "Найди моменты, которые стоит оставить в нарезке: яркая реакция, шутка, конфликт, "
+            "эмоциональный комментарий, что-то смешное или необычное.\n"
+            f"Не больше {max_picks} штук за этот кусок. Только явные моменты, иначе ответь NONE.\n"
+            "Формат каждой строки: ММ:СС - причина в 5-8 слов. Больше ничего не пиши.\n\n"
+            + text
+        )
+        try:
+            answer = deepseek_chat(prompt, api_key, max_tokens=400,
+                                   system="Ты монтажёр нарезок Dota 2. Отбираешь только то, что реально интересно зрителю.")
+        except Exception as e:
+            if log:
+                log(f"[ДОБОР] DeepSeek не ответил: {e}")
+            break
+        for line in (answer or "").splitlines():
+            m = re.match(r"\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]\s*(.+)", line)
+            if m:
+                t = parse_time_str(m.group(1))
+                if t is None:
+                    continue
+                base = block[0][0]
+                limit = base + chunk_sec + 120
+                if not (base - 5 <= t <= limit) and (base + t) <= limit:
+                    t = base + t          # модель дала время внутри куска, а не абсолютное
+                if base - 5 <= t <= limit:
+                    picks.append((t, m.group(2).strip()))
+        i = j
+    return picks
+
 def make_tg_post(video_path, out_path, api_key, log=None, rows=None, max_chars=20000, context=""):
     """Три варианта поста в Telegram в стиле канала — по тому, что происходит в ролике."""
     if rows is None:
@@ -1471,6 +1515,7 @@ class UnifiedDotaStudioApp:
             "keep_intro": _get("keep_intro_var", True),
             "keep_outro": _get("keep_outro_var", True),
             "keep_kills": _get("keep_kills_var", True),
+            "smart_fill": _get("smart_fill_var", False),
             "smooth_cuts": _get("smooth_cuts_var", True),
             "censor_after_cut": _get("censor_after_cut_var", True),
             "audio_delay": _get("audio_delay_spin", "0"),
@@ -1617,6 +1662,7 @@ class UnifiedDotaStudioApp:
             if hasattr(self, 'keep_intro_var'): self.keep_intro_var.set(c.get("keep_intro", True))
             if hasattr(self, 'keep_outro_var'): self.keep_outro_var.set(c.get("keep_outro", True))
             if hasattr(self, 'keep_kills_var'): self.keep_kills_var.set(c.get("keep_kills", True))
+            if hasattr(self, 'smart_fill_var'): self.smart_fill_var.set(c.get("smart_fill", False))
             if hasattr(self, 'legacy_cutter_mode_var'): self.legacy_cutter_mode_var.set(c.get("legacy_cutter_mode", True))
             if hasattr(self, 'smooth_cuts_var'): self.smooth_cuts_var.set(c.get("smooth_cuts", True))
             if hasattr(self, 'censor_after_cut_var'): self.censor_after_cut_var.set(c.get("censor_after_cut", True))
@@ -1872,6 +1918,7 @@ class UnifiedDotaStudioApp:
         self.keep_intro_var = tk.BooleanVar(value=True); ttk.Checkbutton(opts_box, text="Все пики", variable=self.keep_intro_var).pack(side=tk.LEFT, padx=(0, 15))
         self.keep_outro_var = tk.BooleanVar(value=True); ttk.Checkbutton(opts_box, text="Все троны", variable=self.keep_outro_var).pack(side=tk.LEFT, padx=(0, 15))
         self.keep_kills_var = tk.BooleanVar(value=True); ttk.Checkbutton(opts_box, text="⚔️ Все килы (CV-счёт)", variable=self.keep_kills_var).pack(side=tk.LEFT, padx=(0, 15))
+        self.smart_fill_var = tk.BooleanVar(value=False); ttk.Checkbutton(opts_box, text="🤖 Умный добор (DeepSeek)", variable=self.smart_fill_var).pack(side=tk.LEFT, padx=(0, 15))
         self.legacy_cutter_mode_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts_box, text="📼 Старый режим (максимум килов, без жесткого лимита времени)", variable=self.legacy_cutter_mode_var).pack(side=tk.LEFT, padx=(0, 15))
         self.smooth_cuts_var = tk.BooleanVar(value=True); ttk.Checkbutton(opts_box, text="✨ Плавные склейки (Fade)", variable=self.smooth_cuts_var).pack(side=tk.LEFT, padx=(0, 15))
@@ -2011,11 +2058,26 @@ class UnifiedDotaStudioApp:
         try:
             target_mins = int(self.cut_slider.get())
             total_target_sec = target_mins * 60.0
-
             self.log("=" * 60)
             self.log(f"СТАРТ МОНТАЖА СЕРИИ: {os.path.basename(video_path)}")
             if do_chat: self.log(f"Подключено видео чата Twitch: {os.path.basename(chat_video_path)}")
             self.log(f"Целевой хронометраж: {target_mins} минут ({target_mins//60}ч {target_mins%60}м).")
+
+            # умный добор: расшифровка всего VOD -> DeepSeek ищет яркие моменты, которых нет в монтаже
+            smart_rows = None
+            smart_key = ((self.deepseek_key_entry.get().strip() if hasattr(self, "deepseek_key_entry") else "")
+                         or os.environ.get("DEEPSEEK_API_KEY", "").strip())
+            if getattr(self, "smart_fill_var", None) is not None and self.smart_fill_var.get():
+                if not smart_key:
+                    self.log("[ДОБОР] Нет ключа DeepSeek — умный добор пропущен.")
+                elif not WHISPER_AVAILABLE:
+                    self.log("[ДОБОР] faster-whisper не установлен — умный добор пропущен.")
+                else:
+                    self.log("[ДОБОР] Расшифровываю VOD для поиска пропущенных моментов (долго)...")
+                    try:
+                        smart_rows = transcribe_segments(video_path, self.log)
+                    except Exception as e:
+                        self.log(f"[ДОБОР] Расшифровка не удалась: {e}")
 
             cmd_audio = [self.ffmpeg_bin, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", temp_audio]
             subprocess.run(cmd_audio, capture_output=True)
@@ -2162,6 +2224,27 @@ class UnifiedDotaStudioApp:
                     map_segs.extend(get_peaks(mid_start, e_end, tgt_calc * 0.35, min_dist=20, is_early=True))
                     map_segs.extend(get_peaks(e_end, mf_end, tgt_calc * 0.45, min_dist=25))
                     map_segs.extend(get_peaks(mf_end, mid_end, tgt_calc * 0.20, min_dist=25))
+
+                # 4. Умный добор: яркие моменты из расшифровки, которых нет в монтаже
+                if smart_rows:
+                    lo = m_start + intro_len
+                    hi = m_end_c - outro_len
+                    covered = [x['range'] for x in map_segs]
+                    fresh = [(t, x) for t, x in smart_rows
+                             if lo <= t <= hi and not any(a <= t <= b for a, b in covered)]
+                    if fresh:
+                        picks = deepseek_find_moments(fresh, smart_key, log=self.log)
+                        added = 0
+                        for pt, why in picks:
+                            if added >= 6:
+                                break
+                            seg = [max(m_start, pt - 8.0), min(m_end_c, pt + 12.0)]
+                            if any(seg[0] < b and a < seg[1] for a, b in covered):
+                                continue
+                            map_segs.append({'range': seg, 'priority': 400})
+                            covered.append(seg)
+                            added += 1
+                            self.log(f"[ДОБОР] +{format_time_hms(seg[0])} — {why}")
 
                 # Склейка перекрывающихся сцен
                 raw_intervals = sorted(map_segs, key=lambda x: x['range'][0])
