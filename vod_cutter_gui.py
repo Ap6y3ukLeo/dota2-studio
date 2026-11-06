@@ -648,6 +648,91 @@ def insert_ad_at(video_path, ad_path, at_sec, out_path, ffmpeg_bin, total_hint=N
             raise RuntimeError("Не удалось вставить рекламу:\n" + r.stderr.strip()[-400:])
     return out_path
 
+_WHISPER_MODEL = None
+
+def get_whisper_model():
+    """Модель Whisper грузится один раз на процесс — это самая дорогая часть."""
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        has_cuda = False
+        try:
+            import torch
+            has_cuda = torch.cuda.is_available()
+        except Exception:
+            pass
+        _WHISPER_MODEL = WhisperModel("base", device="cuda" if has_cuda else "cpu",
+                                      compute_type="float16" if has_cuda else "int8", cpu_threads=4)
+    return _WHISPER_MODEL
+
+def transcribe_range(video_path, start_sec, dur, log=None):
+    """Текст куска видео [start, start+dur] одной строкой."""
+    ff = find_ffmpeg()
+    tmp = os.path.join(TEMP_DIR, f"range_{int(time.time()*1000)}_{int(start_sec)}.wav")
+    subprocess.run([ff, "-y", "-ss", f"{start_sec:.2f}", "-t", f"{dur:.2f}", "-i", video_path,
+                    "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", tmp], capture_output=True)
+    if not os.path.exists(tmp):
+        return ""
+    try:
+        segments, _ = get_whisper_model().transcribe(tmp, language="ru", vad_filter=True, beam_size=1)
+        return " ".join((s.text or "").strip() for s in segments).strip()
+    except Exception:
+        return ""
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+def deepseek_pick_shorts(pool, video_path, short_dur, api_key, count, log=None):
+    """Оценивает кандидатов по расшифровке и возвращает лучшие count моментов."""
+    cands = []
+    for p in pool[:max(count * 3, count)]:
+        start = max(0, p - int(short_dur * 0.35))
+        text = transcribe_range(video_path, start, short_dur, log)
+        if text:
+            cands.append((p, start, text))
+    if len(cands) <= count:
+        return sorted(p for p, _, _ in cands) if cands else []
+
+    lines = []
+    for i, (p, start, text) in enumerate(cands, 1):
+        lines.append(f"{i}) [{format_time_hms(start)}] {text[:400]}")
+
+    prompt = (
+        "Ниже куски стрима Dota 2, из которых надо выбрать лучшие для вертикальных Shorts.\n"
+        "Оцени каждый от 1 до 10: насколько он зайдёт в коротком видео.\n"
+        "Высокий балл — яркая реакция, смешной момент, конфликт, сильная эмоция или понятная мысль.\n"
+        "Низкий — бытовуха, молчание, вода, обсуждение настроек, реклама, ничего не происходит.\n"
+        "Будь строгим: 8-10 ставь только тем, что реально хочется досмотреть.\n"
+        "Ответ: по одной строке на каждый номер, формат «1: 8 - причина в 3-5 слов». Больше ничего.\n\n"
+        + "\n".join(lines)
+    )
+    try:
+        answer = deepseek_chat(prompt, api_key, max_tokens=600,
+                               system="Ты монтажёр коротких вертикальных видео из стримов Dota 2.")
+    except Exception as e:
+        if log:
+            log(f"[SHORTS] DeepSeek не ответил: {e}")
+        return sorted(pool[:count])
+
+    scores = {}
+    for line in (answer or "").splitlines():
+        m = re.match(r"\s*(\d+)\s*[:.)]\s*(\d+)", line)
+        if m:
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(cands):
+                scores[idx] = int(m.group(2))
+    if not scores:
+        if log:
+            log("[SHORTS] Не разобрал ответ модели — беру по громкости.")
+        return sorted(pool[:count])
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:count]
+    if log:
+        for idx, sc in ranked:
+            log(f"[SHORTS] {sc}/10 — {format_time_hms(cands[idx][1])}: {cands[idx][2][:60]}")
+    return sorted(cands[idx][0] for idx, _ in ranked)
+
 def generate_cuts_report(report_path, teaser_segs, story_segs, output_video_path):
     """Создает подробный текстовый отчет со склейками и главами YouTube."""
     try:
@@ -1074,8 +1159,7 @@ def transcribe_segments(video_path, log=None):
     try:
         if log:
             log("[ОПИСАНИЕ] Распознаю речь (это самый долгий шаг)...")
-        model = WhisperModel("base", device="cuda" if has_cuda else "cpu",
-                             compute_type="float16" if has_cuda else "int8", cpu_threads=4)
+        model = get_whisper_model()
         segments, _ = model.transcribe(tmp_wav, language="ru", vad_filter=True, beam_size=1)
         rows = []
         for s in segments:
@@ -1318,7 +1402,7 @@ class UnifiedDotaStudioApp:
 
         # Окно подстраивается под экран (в т.ч. при масштабировании Windows)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        win_w = max(760, min(940, sw - 40))
+        win_w = max(820, min(1080, sw - 40))
         win_h = max(520, min(920, sh - 80))
         pos_x = max(0, (sw - win_w) // 2)
         pos_y = max(0, (sh - win_h) // 3)
@@ -1336,20 +1420,30 @@ class UnifiedDotaStudioApp:
 
     def setup_ui(self):
         style = ttk.Style()
-        style.theme_use("clam")
+        # тёмная тема, если установлен sv-ttk; иначе — прежний вид
+        try:
+            import sv_ttk
+            sv_ttk.set_theme("dark")
+            style = ttk.Style()
+        except Exception:
+            style.theme_use("clam")
+        try:
+            self.root.configure(bg=style.lookup("TFrame", "background") or "#1f1f1f")
+        except Exception:
+            pass
 
         # Вкладки занимают всё свободное место, консоль — фиксированную высоту снизу
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 4))
 
-        self.tab_cutter = self._add_scrollable_tab(" 🎬 1. Монтаж ")
-        self.tab_react = self._add_scrollable_tab(" 📺 2. Реакции ")
-        self.tab_clips = self._add_scrollable_tab(" 🔥 3. Клипы ")
-        self.tab_shorts = self._add_scrollable_tab(" 📱 4. Shorts ")
-        self.tab_censor = self._add_scrollable_tab(" 🔇 5. Цензура ")
-        self.tab_overlay = self._add_scrollable_tab(" 🖼 6. Баннер ")
-        self.tab_ads = self._add_scrollable_tab(" 📢 7. Реклама ")
-        self.tab_desc = self._add_scrollable_tab(" 🤖 8. Описание ")
+        self.tab_cutter = self._add_scrollable_tab(" 1 · Монтаж ")
+        self.tab_react = self._add_scrollable_tab(" 2 · Реакции ")
+        self.tab_clips = self._add_scrollable_tab(" 3 · Клипы ")
+        self.tab_shorts = self._add_scrollable_tab(" 4 · Shorts ")
+        self.tab_censor = self._add_scrollable_tab(" 5 · Цензура ")
+        self.tab_overlay = self._add_scrollable_tab(" 6 · Баннер ")
+        self.tab_ads = self._add_scrollable_tab(" 7 · Реклама ")
+        self.tab_desc = self._add_scrollable_tab(" 8 · Описание ")
 
         self.build_cutter_tab()
         self.build_react_tab()
@@ -1580,6 +1674,7 @@ class UnifiedDotaStudioApp:
             "shorts_swears": _get("shorts_swears_entry"),
             "shorts_ad": _get("shorts_ad_var", False),
             "shorts_ad_file": _get("shorts_ad_entry"),
+            "shorts_smart": _get("shorts_smart_var", False),
 
             # Цензор / Оверлей
             "censor_input": _get("censor_input_entry"),
@@ -1747,6 +1842,7 @@ class UnifiedDotaStudioApp:
             _set_entry("shorts_swears_entry", c.get("shorts_swears", find_default_swears_file()))
             if hasattr(self, 'shorts_ad_var'): self.shorts_ad_var.set(c.get("shorts_ad", False))
             _set_entry("shorts_ad_entry", c.get("shorts_ad_file", ""))
+            if hasattr(self, 'shorts_smart_var'): self.shorts_smart_var.set(c.get("shorts_smart", False))
 
             # Цензор / Оверлей
             _set_entry("censor_input_entry", c.get("censor_input", ""))
@@ -3130,6 +3226,13 @@ class UnifiedDotaStudioApp:
         self.shorts_swears_entry = ttk.Entry(p_row2, width=38); self.shorts_swears_entry.pack(side=tk.LEFT, padx=8)
         ttk.Button(p_row2, text="Обзор словаря...", command=self.browse_swears_file).pack(side=tk.LEFT)
 
+        p_row3 = ttk.Frame(param_box); p_row3.pack(fill=tk.X, pady=3)
+        self.shorts_smart_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(p_row3, text="🤖 Выбирать моменты через DeepSeek (берёт втрое больше кандидатов и оценивает по расшифровке)",
+                        variable=self.shorts_smart_var).pack(anchor=tk.W)
+        ttk.Label(param_box, text="Без галочки берутся самые громкие места — на IRL это часто крик и толпа.",
+                  font=("Arial", 8, "italic"), foreground="#00aa00").pack(anchor=tk.W)
+
         ad_box = ttk.LabelFrame(self.tab_shorts, text=" 4. Реклама DotaUp (вставка в начало) ", padding="8"); ad_box.pack(fill=tk.X, pady=4)
         self.shorts_ad_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(ad_box, text="Вставлять рекламный ролик в начало каждого Shorts", variable=self.shorts_ad_var).pack(anchor=tk.W)
@@ -3205,7 +3308,18 @@ class UnifiedDotaStudioApp:
                 rms_values = np.array([np.sqrt(np.mean(data[i*window_size:(i+1)*window_size]**2)) for i in range(num_windows)])
 
                 pks, _ = find_peaks(rms_values, distance=short_dur + 5)
-                chosen_peaks = sorted(sorted(pks, key=lambda p: rms_values[p], reverse=True)[:count])
+                pool = sorted(pks, key=lambda p: rms_values[p], reverse=True)[:max(count * 3, count)]
+                smart_key = ((self.deepseek_key_entry.get().strip() if hasattr(self, "deepseek_key_entry") else "")
+                             or os.environ.get("DEEPSEEK_API_KEY", "").strip())
+                if (getattr(self, "shorts_smart_var", None) is not None and self.shorts_smart_var.get()
+                        and smart_key and WHISPER_AVAILABLE):
+                    self.log(f"[SHORTS] Оцениваю {len(pool)} кандидатов через DeepSeek...")
+                    chosen_peaks = deepseek_pick_shorts(pool, vid, short_dur, smart_key, count, self.log)
+                    if not chosen_peaks:
+                        chosen_peaks = sorted(pool[:count])
+                else:
+                    chosen_peaks = sorted(pool[:count])
+                self.log(f"[SHORTS] Отобрано моментов: {len(chosen_peaks)}")
 
                 os.makedirs(out_dir, exist_ok=True)
                 stack = (
@@ -3213,6 +3327,7 @@ class UnifiedDotaStudioApp:
                     f"[0:v]crop=1300:1080:310:0,scale=1080:1320:force_original_aspect_ratio=increase,crop=1080:1320[game];"
                     f"[cam][game]vstack"
                 )
+                chroma = False
                 if ad_file:
                     ad_cov, ad_green, ad_dur = ad_probe(self.ffmpeg_bin, ad_file)
                     chroma = ad_dur is not None and ad_green is not None and ad_green > 40.0

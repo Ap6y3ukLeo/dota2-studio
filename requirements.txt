@@ -3,3 +3,4 @@ scipy
 opencv-python
 faster-whisper
 yt-dlp
+sv-ttk
