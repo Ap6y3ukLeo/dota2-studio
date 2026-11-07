@@ -4,3 +4,5 @@ opencv-python
 faster-whisper
 yt-dlp
 sv-ttk
+# PyAV 19 убрал параметр metadata_errors, который использует faster-whisper
+av<19
