@@ -782,6 +782,18 @@ def generate_cuts_report(report_path, teaser_segs, story_segs, output_video_path
     except Exception:
         return None
 
+def media_duration(path, ffmpeg_bin):
+    """Длительность файла в секундах через ffmpeg -i (None, если не прочитать)."""
+    try:
+        info = subprocess.run([ffmpeg_bin, "-hide_banner", "-i", path],
+                              capture_output=True, text=True, errors="replace").stderr
+        m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", info)
+        if m:
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except Exception:
+        pass
+    return None
+
 def run_ffmpeg_with_progress(cmd, total_duration_sec, log_callback):
     """Рендер с прогрессом; при отказе GPU-энкодера повторяет на CPU."""
     try:
@@ -1411,6 +1423,7 @@ class UnifiedDotaStudioApp:
 
         self.ffmpeg_bin = find_ffmpeg()
         self.temp_dir_var = tk.StringVar(value=TEMP_DIR)
+        self.keep_awake_var = tk.BooleanVar(value=True)
         self.react_fragment_rows = []
 
         self.setup_ui()
@@ -1466,6 +1479,13 @@ class UnifiedDotaStudioApp:
         self.temp_dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
         ttk.Button(temp_row, text="Выбрать...", command=self.browse_temp_dir).pack(side=tk.LEFT)
         ttk.Button(temp_row, text="Открыть", command=self.open_temp_dir).pack(side=tk.LEFT, padx=(5, 0))
+
+        awake_row = ttk.Frame(bottom_frame)
+        awake_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Checkbutton(awake_row, text="Не давать ПК уснуть во время рендера",
+                        variable=self.keep_awake_var).pack(side=tk.LEFT)
+        ttk.Label(awake_row, text="(экран может гаснуть, рендер продолжится)",
+                  font=("Arial", 8, "italic")).pack(side=tk.LEFT, padx=(8, 0))
 
         self.progress_bar = ttk.Progressbar(bottom_frame, mode='indeterminate')
         self.progress_bar.pack(fill=tk.X, pady=(0, 4))
@@ -1579,6 +1599,7 @@ class UnifiedDotaStudioApp:
 
         config = {
             "temp_dir": self.temp_dir_var.get() if hasattr(self, "temp_dir_var") else TEMP_DIR,
+            "keep_awake": bool(self.keep_awake_var.get()) if hasattr(self, "keep_awake_var") else True,
             "use_gpu_qsv": bool(_config_value("use_gpu_qsv", True)),
             "cut_input": _get("cut_input_entry"),
             "cut_chat_vid": _get("cut_chat_vid_entry"),
@@ -1781,6 +1802,8 @@ class UnifiedDotaStudioApp:
             _t = str(c.get("temp_dir", "") or "").strip()
             if _t and os.path.isdir(_t) and hasattr(self, "temp_dir_var"):
                 self.temp_dir_var.set(os.path.normpath(_t))
+            if hasattr(self, "keep_awake_var"):
+                self.keep_awake_var.set(c.get("keep_awake", True))
 
             # Реакции
             _set_entry("react_input_entry", c.get("react_input", ""))
@@ -2740,6 +2763,7 @@ class UnifiedDotaStudioApp:
         top_btn_bar = ttk.Frame(self.react_time_box)
         top_btn_bar.pack(fill=tk.X, pady=(0, 3))
         ttk.Button(top_btn_bar, text="➕ Добавить фрагмент", command=lambda: self.add_react_fragment("", "")).pack(side=tk.LEFT)
+        ttk.Button(top_btn_bar, text="🎬 Весь файл", command=lambda: self.add_react_fragment("00:00:00", "")).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(top_btn_bar, text=" (например: кейсы 01:10:00 - 01:45:00, потом снова кейсы 03:20:00 - 03:55:00)", font=("Arial", 8, "italic"), foreground="#00aa00").pack(side=tk.LEFT, padx=10)
 
         self.react_frags_container = ttk.Frame(self.react_time_box)
@@ -2850,6 +2874,12 @@ class UnifiedDotaStudioApp:
 
         if not vid or not os.path.exists(vid): messagebox.showerror("Ошибка", "Исходное видео не найдено!"); return
         if not out: messagebox.showerror("Ошибка", "Укажите путь сохранения!"); return
+        if os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(vid)):
+            messagebox.showerror("Ошибка", "Путь сохранения совпадает с исходным видео — выберите другой файл.")
+            return
+        if chat_vid and os.path.exists(chat_vid) and os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(chat_vid)):
+            messagebox.showerror("Ошибка", "Путь сохранения совпадает с видео чата — выберите другой файл.")
+            return
 
         parsed_fragments = []
         for r in self.react_fragment_rows:
@@ -2869,6 +2899,7 @@ class UnifiedDotaStudioApp:
         self.set_busy(True)
 
         def worker():
+            nonlocal do_chat, do_overlay
             temp_dir = os.path.join(TEMP_DIR, "react_cut_clips")
             temp_list = os.path.join(temp_dir, "list.txt")
             temp_concat = os.path.join(TEMP_DIR, "react_concat.mkv")
@@ -2880,6 +2911,7 @@ class UnifiedDotaStudioApp:
             clean_audio_wav = None
 
             try:
+                os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
                 os.makedirs(temp_dir, exist_ok=True)
                 if do_chat: os.makedirs(temp_chat_dir, exist_ok=True)
 
@@ -2890,6 +2922,11 @@ class UnifiedDotaStudioApp:
                 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 total_sec = total_frames / fps
+                _ff_dur = media_duration(vid, self.ffmpeg_bin)
+                if _ff_dur and abs(_ff_dur - total_sec) > 1.0:
+                    total_sec = _ff_dur
+                src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+                src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
 
                 normalized_fragments = []
                 for s_val, e_val in parsed_fragments:
@@ -2902,11 +2939,30 @@ class UnifiedDotaStudioApp:
                     cap.release()
                     raise RuntimeError("Время конца отрезков должно быть больше времени начала!")
 
+                # Пересекающиеся фрагменты склеиваем, чтобы не было дублей в готовом видео
+                normalized_fragments.sort(key=lambda x: x[0])
+                merged_frags = []
+                for s_f, e_f in normalized_fragments:
+                    if merged_frags and s_f <= merged_frags[-1][1] + 0.5:
+                        merged_frags[-1][1] = max(merged_frags[-1][1], e_f)
+                    else:
+                        merged_frags.append([s_f, e_f])
+                normalized_fragments = [(s_f, e_f) for s_f, e_f in merged_frags]
+
+                is_reaction = "Реакция" in mode_text
+                if is_reaction:
+                    self.log("[РЕЖИМ] Реакция: видео сохраняется целиком, без вырезания пауз и донатов.")
+
                 all_final_segments = []
 
                 for frag_idx, (seg_start, seg_end) in enumerate(normalized_fragments):
                     seg_duration = seg_end - seg_start
                     self.log(f"--- ОБРАБОТКА ФРАГМЕНТА #{frag_idx+1} ({int(seg_start//3600)}ч {int((seg_start%3600)//60):02d}м -> {int(seg_end//3600)}ч {int((seg_end%3600)//60):02d}м, длина: {int(seg_duration//60)} мин) ---")
+
+                    if is_reaction:
+                        all_final_segments.append([seg_start, seg_end])
+                        self.log(f"[РЕАКЦИЯ] Фрагмент #{frag_idx+1} сохранён целиком.")
+                        continue
 
                     sample_interval = 1.0
                     sample_times = np.arange(seg_start, seg_end, sample_interval)
@@ -2916,7 +2972,10 @@ class UnifiedDotaStudioApp:
                     for idx, t in enumerate(sample_times):
                         cap.set(cv2.CAP_PROP_POS_FRAMES, int(t * fps))
                         ret, frame = cap.read()
-                        if not ret or frame is None: break
+                        if not ret or frame is None:
+                            self.log(f"[ВНИМАНИЕ] Не удалось прочитать кадр на {int(t)} с — остаток фрагмента оставляю без нарезки.")
+                            motion_scores[idx:] = 999.0
+                            break
                         h, w = frame.shape[:2]
                         crop = cv2.cvtColor(frame[int(h*0.15):int(h*0.85), int(w*0.15):int(w*0.85)], cv2.COLOR_BGR2GRAY)
                         crop_small = cv2.resize(crop, (160, 90))
@@ -2925,6 +2984,8 @@ class UnifiedDotaStudioApp:
                             diff = cv2.absdiff(crop_small, prev_crop)
                             motion_scores[idx] = np.mean(diff)
                         prev_crop = crop_small
+                        if idx and idx % 300 == 0:
+                            self.log(f"[АНАЛИЗ] Фрагмент #{frag_idx+1}: {idx}/{len(sample_times)} с")
 
                     donation_ranges = []
                     if cut_donations and WHISPER_AVAILABLE:
@@ -2957,7 +3018,6 @@ class UnifiedDotaStudioApp:
                             merged_donations[-1][1] = max(merged_donations[-1][1], d_r[1])
                         else: merged_donations.append(d_r)
 
-                    is_react_video = "Реакция" in mode_text
                     motion_threshold = 2.2
 
                     keep_segments = []
@@ -2967,7 +3027,7 @@ class UnifiedDotaStudioApp:
                         is_playing = motion_scores[sec_idx] > motion_threshold
                         is_in_donation = any(d[0] <= t <= d[1] for d in merged_donations)
 
-                        if is_playing or not is_react_video:
+                        if is_playing:
                             if pause_start is not None:
                                 pause_dur = t - pause_start
                                 if pause_dur > max_pause_sec or is_in_donation:
@@ -3008,27 +3068,42 @@ class UnifiedDotaStudioApp:
 
                 for idx, (st, en) in enumerate(all_final_segments):
                     fn = f"react_{idx:04d}.mkv"
-                    cmd = [self.ffmpeg_bin, "-y", "-ss", str(st), "-to", str(en), "-i", vid] + slice_args + [os.path.join(temp_dir, fn)]
-                    subprocess.run(cmd, capture_output=True)
+                    clip_path = os.path.join(temp_dir, fn)
+                    cmd = [self.ffmpeg_bin, "-y", "-ss", str(st), "-to", str(en), "-i", vid] + slice_args + [clip_path]
+                    res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+                    if res.returncode != 0 or not os.path.exists(clip_path) or os.path.getsize(clip_path) < 1024:
+                        raise RuntimeError(f"Не удалось нарезать сцену #{idx+1} ({st:.1f}–{en:.1f} с): {res.stderr.strip()[-300:]}")
                     clip_names.append(fn)
 
                     if do_chat:
                         cfn = f"chat_{idx:04d}.mkv"
+                        chat_path = os.path.join(temp_chat_dir, cfn)
                         cmd_c = [self.ffmpeg_bin, "-y", "-ss", str(st), "-to", str(en), "-i", chat_vid,
                                  "-vf", "setpts=PTS-STARTPTS"] + video_enc_args(self.ffmpeg_bin, "ultrafast", 22, 60) + [
-                                 "-an", os.path.join(temp_chat_dir, cfn)]
-                        subprocess.run(cmd_c, capture_output=True)
-                        chat_clip_names.append(cfn)
+                                 "-an", chat_path]
+                        res = subprocess.run(cmd_c, capture_output=True, text=True, errors="replace")
+                        if res.returncode != 0 or not os.path.exists(chat_path) or os.path.getsize(chat_path) < 1024:
+                            self.log("[ЧАТ] Не удалось нарезать чат — накладывать не буду.")
+                            do_chat = False
+                        else:
+                            chat_clip_names.append(cfn)
 
                 with open(temp_list, "w", encoding="utf-8") as f:
                     for n in clip_names: f.write(f"file '{n}'\n")
 
-                subprocess.run([self.ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy", os.path.abspath(temp_concat)], cwd=temp_dir, capture_output=True)
+                res = subprocess.run([self.ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy", os.path.abspath(temp_concat)],
+                                     cwd=temp_dir, capture_output=True, text=True, errors="replace")
+                if res.returncode != 0 or not os.path.exists(temp_concat) or os.path.getsize(temp_concat) < 1024:
+                    raise RuntimeError(f"Не удалось склеить сцены: {res.stderr.strip()[-300:]}")
 
                 if do_chat:
                     with open(temp_chat_list, "w", encoding="utf-8") as f:
                         for cn in chat_clip_names: f.write(f"file '{cn}'\n")
-                    subprocess.run([self.ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", "list_chat.txt", "-c", "copy", os.path.abspath(temp_concat_chat)], cwd=temp_chat_dir, capture_output=True)
+                    res = subprocess.run([self.ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", "list_chat.txt", "-c", "copy", os.path.abspath(temp_concat_chat)],
+                                         cwd=temp_chat_dir, capture_output=True, text=True, errors="replace")
+                    if res.returncode != 0 or not os.path.exists(temp_concat_chat) or os.path.getsize(temp_concat_chat) < 1024:
+                        self.log("[ЧАТ] Не удалось склеить чат — накладывать не буду.")
+                        do_chat = False
 
                 if self.censor_after_cut_var.get() and sw_file and os.path.exists(sw_file):
                     clean_audio_wav, _ = self.mute_audio_data(temp_concat, sw_file)
@@ -3052,40 +3127,61 @@ class UnifiedDotaStudioApp:
 
                 if do_overlay:
                     try:
-                        bx = int(self.react_x_entry.get()), int(self.react_y_entry.get())
+                        bx, by = int(self.react_x_entry.get()), int(self.react_y_entry.get())
                         bw, bh = int(self.react_w_entry.get()), int(self.react_h_entry.get())
                     except:
                         bx, by, bw, bh = 1580, 30, 290, 70
 
                     real_png = remove_fake_checkerboard_transparency(png_file, self.log)
-                    logo_idx = len(inputs) // 2
-                    inputs.extend(["-i", real_png])
+                    if not real_png or not os.path.exists(real_png):
+                        self.log("[ОВЕРЛЕЙ] PNG не найден — пропускаю наложение.")
+                        do_overlay = False
+                    else:
+                        logo_idx = len(inputs) // 2
+                        inputs.extend(["-i", real_png])
 
-                    target_w = int(bw * 1.5); target_h = int(bh * 1.5)
-                    cx_pt = bx + bw // 2; cy_pt = by + bh // 2
-                    pos_x = max(0, min(1920 - target_w, cx_pt - target_w // 2))
-                    pos_y = max(0, min(1080 - target_h, cy_pt - target_h // 2))
+                        target_w = int(bw * 1.5); target_h = int(bh * 1.5)
+                        cx_pt = bx + bw // 2; cy_pt = by + bh // 2
+                        pos_x = max(0, min(src_w - target_w, cx_pt - target_w // 2))
+                        pos_y = max(0, min(src_h - target_h, cy_pt - target_h // 2))
 
-                    filter_chains.append(f"[{logo_idx}:v]scale={target_w}:{target_h}[logo]")
-                    filter_chains.append(f"[{cur_v}][logo]overlay={pos_x}:{pos_y}[v_out]")
-                    cur_v = "v_out"
+                        filter_chains.append(f"[{logo_idx}:v]scale={target_w}:{target_h}[logo]")
+                        filter_chains.append(f"[{cur_v}][logo]overlay={pos_x}:{pos_y}[v_out]")
+                        cur_v = "v_out"
 
-                enc = video_enc_args(self.ffmpeg_bin, "faster", 20, 60) + ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+                enc = video_enc_args(self.ffmpeg_bin, "faster", 20, 60) + ["-c:a", "aac", "-b:a", "192k"]
+                expected_duration = sum(en - st for st, en in all_final_segments)
                 if filter_chains:
                     audio_src = f"{len(inputs)//2}:a:0" if clean_audio_wav else "0:a:0"
                     if clean_audio_wav: inputs.extend(["-i", clean_audio_wav])
                     cmd_final = [self.ffmpeg_bin, "-y"] + inputs + ["-filter_complex", ";".join(filter_chains), "-map", f"[{cur_v}]", "-map", audio_src] + enc + [out]
                 else:
                     cmd_final = [self.ffmpeg_bin, "-y", "-i", temp_concat]
-                    if clean_audio_wav: cmd_final.extend(["-i", clean_audio_wav, "-map", "0:v:0", "-map", "1:a:0"])
-                    cmd_final.extend(enc + [out] if clean_audio_wav else ["-c", "copy", out])
+                    if clean_audio_wav:
+                        cmd_final.extend(["-i", clean_audio_wav, "-map", "0:v:0", "-map", "1:a:0"] + enc + [out])
+                    else:
+                        # Видео копируем без перекодирования, но звук обязательно в AAC:
+                        # MP4 с PCM-звуком читается не всеми плеерами и хуже грузится на площадки.
+                        cmd_final.extend(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out])
 
-                subprocess.run(cmd_final, capture_output=True)
+                res = subprocess.run(cmd_final, capture_output=True, text=True, errors="replace")
+                if res.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1024:
+                    raise RuntimeError(f"Финальный рендер не удался: {res.stderr.strip()[-500:]}")
+
+                actual_duration = media_duration(out, self.ffmpeg_bin)
+                if actual_duration is None:
+                    self.log("[ПРОВЕРКА] Не удалось прочитать длительность готового файла.")
+                else:
+                    diff = actual_duration - expected_duration
+                    self.log(f"[ПРОВЕРКА] Ожидалось {expected_duration:.1f} с, получилось {actual_duration:.1f} с (разница {diff:+.1f} с).")
+                    if abs(diff) > 2.0:
+                        self.log("[ВНИМАНИЕ] Длительность отличается больше чем на 2 секунды — проверьте файл.")
+
                 self.log(f"[УСПЕХ] Готово! Сохранено в: {out}")
                 self.root.after(0, lambda: messagebox.showinfo("Готово!", f"Все фрагменты смонтированы и склеены!\nФайл: {os.path.basename(out)}"))
             except Exception as e:
                 self.log(f"[ОШИБКА] {e}")
-                self.root.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+                self.root.after(0, lambda msg=str(e): messagebox.showerror("Ошибка", msg))
             finally:
                 if os.path.exists(temp_dir): shutil.rmtree(temp_dir, ignore_errors=True)
                 if os.path.exists(temp_chat_dir): shutil.rmtree(temp_chat_dir, ignore_errors=True)
@@ -3959,6 +4055,7 @@ class UnifiedDotaStudioApp:
             if hasattr(self, "btn_run_ad"): self.btn_run_ad.config(state=tk.DISABLED)
             if hasattr(self, "btn_run_desc"): self.btn_run_desc.config(state=tk.DISABLED)
             self.progress_bar.start(10)
+            self._set_keep_awake(True)
         else:
             self.btn_run_cutter.config(state=tk.NORMAL); self.btn_run_react.config(state=tk.NORMAL)
             self.btn_run_censor_only.config(state=tk.NORMAL); self.btn_run_single_overlay.config(state=tk.NORMAL)
@@ -3966,6 +4063,23 @@ class UnifiedDotaStudioApp:
             if hasattr(self, "btn_run_desc"): self.btn_run_desc.config(state=tk.NORMAL)
             self.btn_run_clips.config(state=tk.NORMAL); self.btn_run_shorts.config(state=tk.NORMAL)
             self.progress_bar.stop()
+            self._set_keep_awake(False)
+
+    def _set_keep_awake(self, enable):
+        """Запрещает Windows уходить в сон, пока идёт рендер (экран при этом может гаснуть)."""
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            if enable and getattr(self, "keep_awake_var", None) and self.keep_awake_var.get():
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+                self.log("[СИСТЕМА] Сон Windows заблокирован на время рендера.")
+            else:
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        except Exception:
+            pass
 
     def log(self, message):
         timestamp = time.strftime("[%H:%M:%S] ")
